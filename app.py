@@ -198,7 +198,7 @@ def read_workbook(file):
 
 def make_output_excel(well, casing, survey, geo, temp, fitlot, shoes, geocalc):
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
         pd.DataFrame({"Field": list(well.keys()), "Value": list(well.values())}).to_excel(writer, "Well_Info", index=False)
         casing.to_excel(writer, "Casing_Program", index=False)
         survey.to_excel(writer, "Directional_Survey_Calc", index=False)
