@@ -198,16 +198,98 @@ def read_workbook(file):
 
 def make_output_excel(well, casing, survey, geo, temp, fitlot, shoes, geocalc):
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        pd.DataFrame({"Field": list(well.keys()), "Value": list(well.values())}).to_excel(writer, "Well_Info", index=False)
-        casing.to_excel(writer, "Casing_Program", index=False)
-        survey.to_excel(writer, "Directional_Survey_Calc", index=False)
-        geo.to_excel(writer, "Geological_Tops", index=False)
-        temp.to_excel(writer, "Temperature_Gradient", index=False)
-        fitlot.to_excel(writer, "FIT_LOT", index=False)
-        shoes.to_excel(writer, "Calculated_Shoe_Data", index=False)
-        geocalc.to_excel(writer, "Calculated_Geo_Data", index=False)
+
+    # Convert values that Excel cannot directly write
+    def clean_value(value):
+        if value is None:
+            return ""
+
+        # Handle pandas / numpy missing values
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+
+        # Excel cells cannot directly contain lists/dicts/sets
+        if isinstance(value, (list, dict, tuple, set)):
+            return str(value)
+
+        # Convert numpy scalar types to native Python values
+        if isinstance(value, np.generic):
+            return value.item()
+
+        return value
+
+    def clean_dataframe(df):
+        df = df.copy()
+
+        for col in df.columns:
+            df[col] = df[col].map(clean_value)
+
+        return df
+
+    # Build safe well information table
+    well_df = pd.DataFrame({
+        "Field": [str(k) for k in well.keys()],
+        "Value": [clean_value(v) for v in well.values()]
+    })
+
+    with pd.ExcelWriter(
+        bio,
+        engine="xlsxwriter"
+    ) as writer:
+
+        clean_dataframe(well_df).to_excel(
+            writer,
+            sheet_name="Well_Info",
+            index=False
+        )
+
+        clean_dataframe(casing).to_excel(
+            writer,
+            sheet_name="Casing_Program",
+            index=False
+        )
+
+        clean_dataframe(survey).to_excel(
+            writer,
+            sheet_name="Directional_Survey",
+            index=False
+        )
+
+        clean_dataframe(geo).to_excel(
+            writer,
+            sheet_name="Geological_Tops",
+            index=False
+        )
+
+        clean_dataframe(temp).to_excel(
+            writer,
+            sheet_name="Temperature_Gradient",
+            index=False
+        )
+
+        clean_dataframe(fitlot).to_excel(
+            writer,
+            sheet_name="FIT_LOT",
+            index=False
+        )
+
+        clean_dataframe(shoes).to_excel(
+            writer,
+            sheet_name="Calculated_Shoe_Data",
+            index=False
+        )
+
+        clean_dataframe(geocalc).to_excel(
+            writer,
+            sheet_name="Calculated_Geo_Data",
+            index=False
+        )
+
     bio.seek(0)
+
     return bio.getvalue()
 
 
