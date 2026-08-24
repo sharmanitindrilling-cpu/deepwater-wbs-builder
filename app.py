@@ -972,9 +972,34 @@ except Exception as e:
     st.error(f"Could not process workbook: {e}")
     st.stop()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Well / Casing", "Directional Survey", "Geological Tops", "MD ↔ TVD Calculator", "Wellbore Schematic", "Directional WBS", "3D Directional WBS"]
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    [
+        "Daily Operations",
+        "Well / Casing",
+        "Directional Survey",
+        "Geological Tops",
+        "MD ↔ TVD Calculator",
+        "Wellbore Schematic",
+        "Directional WBS",
+        "3D Directional WBS",
+    ]
 )
+
+with tab0:
+    st.subheader("Daily Operations")
+    st.write("Upload the latest Daily Drilling Report and latest directional survey.")
+
+    latest_ddr = st.file_uploader(
+        "Upload Latest DDR",
+        type=["pdf", "docx", "xlsx", "xls"],
+        key="latest_ddr",
+    )
+
+    latest_directional_survey = st.file_uploader(
+        "Upload Latest Directional Survey",
+        type=["xlsx", "xls", "csv"],
+        key="latest_directional_survey",
+    )
 
 with tab1:
     c1, c2 = st.columns(2)
