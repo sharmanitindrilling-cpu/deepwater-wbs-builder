@@ -987,13 +987,61 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
 
 with tab0:
     st.subheader("Daily Operations")
-    st.write("Upload the latest Daily Drilling Report and latest directional survey.")
+
+    st.write(
+        "Upload the latest Daily Drilling Report and latest directional survey."
+    )
 
     latest_ddr = st.file_uploader(
         "Upload Latest DDR",
         type=["pdf", "docx", "xlsx", "xls"],
-        key="latest_ddr",
+        key="latest_ddr"
     )
+
+    latest_directional_survey = st.file_uploader(
+        "Upload Latest Directional Survey",
+        type=["xlsx", "xls", "csv"],
+        key="latest_directional_survey"
+    )
+
+    # Display uploaded filenames
+    if latest_ddr is not None:
+        st.success(f"DDR uploaded: {latest_ddr.name}")
+
+    if latest_directional_survey is not None:
+        st.success(
+            f"Directional survey uploaded: {latest_directional_survey.name}"
+        )
+
+    # Run Daily Update button
+    run_daily_update = st.button(
+        "Run Daily Update",
+        type="primary",
+        key="run_daily_update"
+    )
+
+    # Validate uploaded files
+    if run_daily_update:
+
+        if latest_ddr is None and latest_directional_survey is None:
+            st.warning(
+                "Please upload both the Latest DDR and Latest Directional Survey."
+            )
+
+        elif latest_ddr is None:
+            st.warning(
+                "Please upload the Latest DDR before running the daily update."
+            )
+
+        elif latest_directional_survey is None:
+            st.warning(
+                "Please upload the Latest Directional Survey before running the daily update."
+            )
+
+        else:
+            st.success(
+                "Both files are ready for processing."
+            )
 
     latest_directional_survey = st.file_uploader(
         "Upload Latest Directional Survey",
