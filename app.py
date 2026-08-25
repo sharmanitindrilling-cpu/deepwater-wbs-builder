@@ -1037,6 +1037,30 @@ with tab0:
 
         else:
             st.success("Both files are ready for processing.")
+                try:
+        # Read uploaded directional survey
+        if latest_directional_survey.name.lower().endswith(".csv"):
+            daily_survey_df = pd.read_csv(
+                latest_directional_survey
+            )
+        else:
+            daily_survey_df = pd.read_excel(
+                latest_directional_survey
+            )
+
+        st.subheader(
+            "Latest Directional Survey Preview"
+        )
+
+        st.dataframe(
+            daily_survey_df,
+            use_container_width=True
+        )
+
+    except Exception as e:
+        st.error(
+            f"Could not read the directional survey: {e}"
+        )
 
 with tab1:
     c1, c2 = st.columns(2)
