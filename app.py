@@ -1035,9 +1035,10 @@ with tab0:
                 "Please upload the Latest Directional Survey before running the daily update."
             )
 
-        else:
-            st.success("Both files are ready for processing.")
-            try:
+      else:
+    st.success("Both files are ready for processing.")
+
+    try:
         # Read uploaded directional survey
         if latest_directional_survey.name.lower().endswith(".csv"):
             daily_survey_df = pd.read_csv(
@@ -1061,7 +1062,6 @@ with tab0:
         st.error(
             f"Could not read the directional survey: {e}"
         )
-
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
