@@ -995,16 +995,15 @@ with tab0:
     latest_ddr = st.file_uploader(
         "Upload Latest DDR",
         type=["pdf", "docx", "xlsx", "xls"],
-        key="latest_ddr"
+        key="daily_ops_latest_ddr"
     )
 
     latest_directional_survey = st.file_uploader(
         "Upload Latest Directional Survey",
         type=["xlsx", "xls", "csv"],
-        key="latest_directional_survey"
+        key="daily_ops_latest_directional_survey"
     )
 
-    # Display uploaded filenames
     if latest_ddr is not None:
         st.success(f"DDR uploaded: {latest_ddr.name}")
 
@@ -1013,14 +1012,12 @@ with tab0:
             f"Directional survey uploaded: {latest_directional_survey.name}"
         )
 
-    # Run Daily Update button
     run_daily_update = st.button(
         "Run Daily Update",
         type="primary",
-        key="run_daily_update"
+        key="daily_ops_run_daily_update"
     )
 
-    # Validate uploaded files
     if run_daily_update:
 
         if latest_ddr is None and latest_directional_survey is None:
@@ -1039,15 +1036,7 @@ with tab0:
             )
 
         else:
-            st.success(
-                "Both files are ready for processing."
-            )
-
-    latest_directional_survey = st.file_uploader(
-        "Upload Latest Directional Survey",
-        type=["xlsx", "xls", "csv"],
-        key="latest_directional_survey",
-    )
+            st.success("Both files are ready for processing.")
 
 with tab1:
     c1, c2 = st.columns(2)
