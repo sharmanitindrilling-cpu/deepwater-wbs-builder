@@ -1036,9 +1036,9 @@ with tab0:
             )
 
       else:
-    st.success("Both files are ready for processing.")
+         st.success("Both files are ready for processing.")
 
-    try:
+       try:
         # Read uploaded directional survey
         if latest_directional_survey.name.lower().endswith(".csv"):
             daily_survey_df = pd.read_csv(
