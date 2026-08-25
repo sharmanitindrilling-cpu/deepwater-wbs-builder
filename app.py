@@ -1,4 +1,3 @@
-
 import io
 import math
 import numpy as np
@@ -1019,7 +1018,6 @@ with tab0:
     )
 
     if run_daily_update:
-
         if latest_ddr is None and latest_directional_survey is None:
             st.warning(
                 "Please upload both the Latest DDR and Latest Directional Survey."
@@ -1035,33 +1033,27 @@ with tab0:
                 "Please upload the Latest Directional Survey before running the daily update."
             )
 
-      else:
-         st.success("Both files are ready for processing.")
-
-       try:
-        # Read uploaded directional survey
-        if latest_directional_survey.name.lower().endswith(".csv"):
-            daily_survey_df = pd.read_csv(
-                latest_directional_survey
-            )
         else:
-            daily_survey_df = pd.read_excel(
-                latest_directional_survey
-            )
+            st.success("Both files are ready for processing.")
 
-        st.subheader(
-            "Latest Directional Survey Preview"
-        )
+            try:
+                if latest_directional_survey.name.lower().endswith(".csv"):
+                    daily_survey_df = pd.read_csv(latest_directional_survey)
+                else:
+                    daily_survey_df = pd.read_excel(latest_directional_survey)
 
-        st.dataframe(
-            daily_survey_df,
-            use_container_width=True
-        )
+                st.subheader("Latest Directional Survey Preview")
 
-    except Exception as e:
-        st.error(
-            f"Could not read the directional survey: {e}"
-        )
+                st.dataframe(
+                    daily_survey_df,
+                    use_container_width=True
+                )
+
+            except Exception as e:
+                st.error(
+                    f"Could not read the directional survey: {e}"
+                )
+
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
@@ -1241,4 +1233,5 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
+
 
