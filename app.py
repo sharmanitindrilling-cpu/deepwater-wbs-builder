@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+from pypdf import PdfReader
 
 st.set_page_config(page_title="Deepwater WBS Builder", layout="wide")
 
