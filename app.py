@@ -1053,7 +1053,94 @@ with tab0:
                 st.error(
                     f"Could not read the directional survey: {e}"
                 )
-                
+                # -----------------------------------
+# Compare Actual vs Planned Directional
+# -----------------------------------
+
+actual_md = float(latest_station["MD_ft"])
+
+planned_inc = interp_by_md(
+    survey,
+    actual_md,
+    "Inclination_deg"
+)
+
+planned_azi = interp_by_md(
+    survey,
+    actual_md,
+    "Azimuth_deg"
+)
+
+actual_inc = float(
+    latest_station["Inclination_deg"]
+)
+
+actual_azi = float(
+    latest_station["Azimuth_deg"]
+)
+
+actual_dls = float(
+    latest_station["DLS_calc_deg_per_100ft"]
+)
+
+inc_variance = actual_inc - planned_inc
+azi_variance = actual_azi - planned_azi
+
+st.subheader("Directional Plan vs Actual")
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.metric(
+        "Inclination",
+        f"{actual_inc:.2f}°",
+        delta=f"{inc_variance:+.2f}° vs plan"
+    )
+
+with c2:
+    st.metric(
+        "Azimuth",
+        f"{actual_azi:.2f}°",
+        delta=f"{azi_variance:+.2f}° vs plan"
+    )
+
+with c3:
+    st.metric(
+        "DLS",
+        f"{actual_dls:.2f}°/100 ft"
+    )
+    
+         # Directional warning limits
+INC_WARNING = 2.0
+AZI_WARNING = 5.0
+DLS_WARNING = 3.0
+
+st.subheader("Directional Status")
+
+if abs(inc_variance) > INC_WARNING:
+    st.warning(
+        f"Inclination is {inc_variance:+.2f}° from plan."
+    )
+
+if abs(azi_variance) > AZI_WARNING:
+    st.warning(
+        f"Azimuth is {azi_variance:+.2f}° from plan."
+    )
+
+if actual_dls > DLS_WARNING:
+    st.warning(
+        f"DLS is {actual_dls:.2f}°/100 ft, "
+        f"above the {DLS_WARNING:.1f}°/100 ft warning limit."
+    )
+
+if (
+    abs(inc_variance) <= INC_WARNING
+    and abs(azi_variance) <= AZI_WARNING
+    and actual_dls <= DLS_WARNING
+):
+    st.success(
+        "Directional survey is within the current warning limits."
+    )       
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
