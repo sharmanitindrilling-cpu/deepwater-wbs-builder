@@ -1053,7 +1053,37 @@ with tab0:
                 st.error(
                     f"Could not read the directional survey: {e}"
                 )
+                
+# Latest survey station
+latest_station = daily_survey_calculated.iloc[-1]
 
+st.subheader("Latest Survey Station")
+
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.metric(
+        "MD",
+        f"{latest_station['MD_ft']:,.1f} ft"
+    )
+
+with c2:
+    st.metric(
+        "TVD",
+        f"{latest_station['TVD_ft']:,.1f} ft"
+    )
+
+with c3:
+    st.metric(
+        "Inclination",
+        f"{latest_station['Inclination_deg']:.2f}°"
+    )
+
+with c4:
+    st.metric(
+        "DLS",
+        f"{latest_station['DLS_calc_deg_per_100ft']:.2f}°/100 ft"
+    )
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
