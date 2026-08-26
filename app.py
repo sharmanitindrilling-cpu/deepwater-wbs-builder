@@ -945,6 +945,29 @@ def draw_3d_directional_wbs(
     return fig
 
 
+
+
+def extract_ddr_text(uploaded_file):
+    """Extract text from an uploaded DDR PDF using pypdf."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ImportError(
+            "The pypdf package is not installed. Add 'pypdf' to requirements.txt."
+        ) from exc
+
+    uploaded_file.seek(0)
+    reader = PdfReader(uploaded_file)
+    pages = []
+
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+
+    return "\n\n".join(pages)
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -1035,6 +1058,41 @@ with tab0:
 
         else:
             st.success("Both files are ready for processing.")
+
+            # -----------------------------------
+            # Read Daily Drilling Report PDF
+            # -----------------------------------
+            if latest_ddr.name.lower().endswith(".pdf"):
+                try:
+                    ddr_text = extract_ddr_text(latest_ddr)
+                    st.session_state["latest_ddr_text"] = ddr_text
+
+                    if ddr_text.strip():
+                        st.success("Daily Drilling Report text extracted successfully.")
+                    else:
+                        st.warning(
+                            "The DDR PDF was opened, but no selectable text was found. "
+                            "This may be a scanned/image-only PDF."
+                        )
+
+                except Exception as e:
+                    st.error(f"Could not read the DDR PDF: {e}")
+            else:
+                st.info(
+                    "DDR text extraction currently supports PDF files. "
+                    "PDF is recommended for the first Daily Report Agent version."
+                )
+
+            if "latest_ddr_text" in st.session_state:
+                st.subheader("DDR Text Preview")
+                ddr_preview = st.session_state["latest_ddr_text"]
+
+                st.text_area(
+                    "Extracted DDR text",
+                    ddr_preview[:10000],
+                    height=350,
+                    key="daily_ops_ddr_preview",
+                )
 
             try:
                 # -----------------------------------
@@ -1312,21 +1370,6 @@ with tab0:
                     f"Could not process the directional survey: {e}"
                 )
 
-# ---------------------------------------------------------
-# Directional display source
-# Use the latest processed ACTUAL survey when available.
-# Otherwise fall back to the planned survey from the WBS workbook.
-# ---------------------------------------------------------
-actual_survey = st.session_state.get("latest_actual_survey", None)
-
-if actual_survey is not None and isinstance(actual_survey, pd.DataFrame) and not actual_survey.empty:
-    directional_display_survey = actual_survey
-    directional_display_source = "ACTUAL"
-else:
-    directional_display_survey = survey
-    directional_display_source = "PLANNED"
-
-
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
@@ -1397,17 +1440,7 @@ with tab5:
         )
 
 with tab6:
-    if directional_display_source == "ACTUAL":
-        st.success("Displaying latest ACTUAL directional survey")
-    else:
-        st.info("Displaying PLANNED directional survey")
-
-    fig_dir = draw_directional_wbs(
-        well,
-        directional_display_survey,
-        shoes,
-        geocalc
-    )
+    fig_dir = draw_directional_wbs(well, survey, shoes, geocalc)
     st.pyplot(fig_dir, use_container_width=False)
 
     dir_png_buf = io.BytesIO()
@@ -1437,11 +1470,6 @@ with tab6:
 with tab7:
     st.subheader("3D display controls")
 
-    if directional_display_source == "ACTUAL":
-        st.success("Displaying latest ACTUAL directional survey")
-    else:
-        st.info("Displaying PLANNED directional survey")
-
     t1, t2, t3, t4 = st.columns(4)
     with t1:
         show_trajectory = st.toggle("Trajectory", value=True, key="3d_trajectory")
@@ -1463,7 +1491,7 @@ with tab7:
 
     fig_3d = draw_3d_directional_wbs(
         well,
-        directional_display_survey,
+        survey,
         shoes,
         geocalc,
         show_trajectory=show_trajectory,
@@ -1521,3 +1549,5 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
+
+
