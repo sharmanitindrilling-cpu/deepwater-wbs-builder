@@ -1037,133 +1037,281 @@ with tab0:
             st.success("Both files are ready for processing.")
 
             try:
+                # -----------------------------------
+                # Read latest actual directional survey
+                # -----------------------------------
                 if latest_directional_survey.name.lower().endswith(".csv"):
                     daily_survey_df = pd.read_csv(latest_directional_survey)
                 else:
                     daily_survey_df = pd.read_excel(latest_directional_survey)
 
-                st.subheader("Latest Directional Survey Preview")
+                # Clean column names before mapping.
+                daily_survey_df.columns = [
+                    str(col).strip() for col in daily_survey_df.columns
+                ]
 
-                st.dataframe(
-                    daily_survey_df,
-                    use_container_width=True
-                )
+                st.subheader("Latest Directional Survey Preview")
+                st.dataframe(daily_survey_df, use_container_width=True)
+
+                # -----------------------------------
+                # Map common survey headings to the
+                # standard names used by the WBS app.
+                # -----------------------------------
+                column_aliases = {
+                    "MD": "MD_ft",
+                    "MD (FT)": "MD_ft",
+                    "MD_FT": "MD_ft",
+                    "INC": "Inclination_deg",
+                    "INCL": "Inclination_deg",
+                    "INCLINATION": "Inclination_deg",
+                    "AZI": "Azimuth_deg",
+                    "AZIMUTH": "Azimuth_deg",
+                    "TVD": "TVD_ft",
+                    "TVD (FT)": "TVD_ft",
+                    "DLS": "DLS_calc_deg_per_100ft",
+                    "DLS (DEG/100FT)": "DLS_calc_deg_per_100ft",
+                    "NORTHINGS": "Northing_calc_ft",
+                    "NORTHING": "Northing_calc_ft",
+                    "EASTINGS": "Easting_calc_ft",
+                    "EASTING": "Easting_calc_ft",
+                }
+
+                rename_map = {}
+                for col in daily_survey_df.columns:
+                    normalized = str(col).strip().upper()
+                    if normalized in column_aliases:
+                        rename_map[col] = column_aliases[normalized]
+
+                daily_survey_mapped = daily_survey_df.rename(
+                    columns=rename_map
+                ).copy()
+
+                # If the uploaded survey already uses the WBS names,
+                # this leaves them unchanged.
+                required_columns = [
+                    "MD_ft",
+                    "Inclination_deg",
+                    "Azimuth_deg",
+                ]
+
+                missing_columns = [
+                    col for col in required_columns
+                    if col not in daily_survey_mapped.columns
+                ]
+
+                if missing_columns:
+                    st.error(
+                        "The directional survey is missing required columns: "
+                        + ", ".join(missing_columns)
+                    )
+                    st.info(
+                        "The app can recognize common names such as "
+                        "MD, INC, AZI, TVD, DLS, Northings and Eastings."
+                    )
+
+                else:
+                    # Convert the key columns to numeric and remove invalid rows.
+                    numeric_columns = [
+                        "MD_ft",
+                        "Inclination_deg",
+                        "Azimuth_deg",
+                        "TVD_ft",
+                        "DLS_calc_deg_per_100ft",
+                        "Northing_calc_ft",
+                        "Easting_calc_ft",
+                    ]
+
+                    for col in numeric_columns:
+                        if col in daily_survey_mapped.columns:
+                            daily_survey_mapped[col] = pd.to_numeric(
+                                daily_survey_mapped[col],
+                                errors="coerce"
+                            )
+
+                    daily_survey_mapped = (
+                        daily_survey_mapped
+                        .dropna(subset=required_columns)
+                        .sort_values("MD_ft")
+                        .reset_index(drop=True)
+                    )
+
+                    if daily_survey_mapped.empty:
+                        st.error(
+                            "No valid directional survey stations were found after cleaning the file."
+                        )
+
+                    else:
+                        # If TVD or DLS are not supplied, calculate them using
+                        # the existing minimum-curvature engine.
+                        needs_calculation = (
+                            "TVD_ft" not in daily_survey_mapped.columns
+                            or daily_survey_mapped["TVD_ft"].isna().any()
+                            or "DLS_calc_deg_per_100ft" not in daily_survey_mapped.columns
+                            or daily_survey_mapped["DLS_calc_deg_per_100ft"].isna().any()
+                        )
+
+                        if needs_calculation:
+                            calc_input = daily_survey_mapped.copy()
+                            if "TVD_ft" in calc_input.columns:
+                                calc_input["TVD_ft_optional"] = calc_input["TVD_ft"]
+                            daily_survey_mapped = minimum_curvature_tvd(calc_input)
+
+                        latest_station = daily_survey_mapped.iloc[-1]
+
+                        # Keep the processed actual survey available during this session.
+                        st.session_state["latest_actual_survey"] = daily_survey_mapped
+
+                        st.subheader("Latest Actual Survey Station")
+
+                        m1, m2, m3, m4 = st.columns(4)
+
+                        with m1:
+                            st.metric(
+                                "MD",
+                                f"{latest_station['MD_ft']:,.1f} ft"
+                            )
+
+                        with m2:
+                            if "TVD_ft" in latest_station.index and pd.notna(latest_station["TVD_ft"]):
+                                st.metric(
+                                    "TVD",
+                                    f"{latest_station['TVD_ft']:,.1f} ft"
+                                )
+                            else:
+                                st.metric("TVD", "N/A")
+
+                        with m3:
+                            st.metric(
+                                "Inclination",
+                                f"{latest_station['Inclination_deg']:.2f}°"
+                            )
+
+                        with m4:
+                            if (
+                                "DLS_calc_deg_per_100ft" in latest_station.index
+                                and pd.notna(latest_station["DLS_calc_deg_per_100ft"])
+                            ):
+                                st.metric(
+                                    "DLS",
+                                    f"{latest_station['DLS_calc_deg_per_100ft']:.2f}°/100 ft"
+                                )
+                            else:
+                                st.metric("DLS", "N/A")
+
+                        # -----------------------------------
+                        # Compare latest Actual vs Planned
+                        # -----------------------------------
+                        actual_md = float(latest_station["MD_ft"])
+
+                        planned_inc = interp_by_md(
+                            survey, actual_md, "Inclination_deg"
+                        )
+                        planned_azi = interp_by_md(
+                            survey, actual_md, "Azimuth_deg"
+                        )
+
+                        actual_inc = float(
+                            latest_station["Inclination_deg"]
+                        )
+                        actual_azi = float(
+                            latest_station["Azimuth_deg"]
+                        )
+
+                        if (
+                            "DLS_calc_deg_per_100ft" in latest_station.index
+                            and pd.notna(latest_station["DLS_calc_deg_per_100ft"])
+                        ):
+                            actual_dls = float(
+                                latest_station["DLS_calc_deg_per_100ft"]
+                            )
+                        else:
+                            actual_dls = np.nan
+
+                        if pd.isna(planned_inc) or pd.isna(planned_azi):
+                            st.warning(
+                                "The latest actual MD is outside the planned survey range, "
+                                "so Plan vs Actual comparison cannot be calculated at this depth."
+                            )
+
+                        else:
+                            inc_variance = actual_inc - planned_inc
+
+                            # Use shortest angular difference for azimuth.
+                            azi_variance = (
+                                (actual_azi - planned_azi + 180.0) % 360.0
+                            ) - 180.0
+
+                            st.subheader("Directional Plan vs Actual")
+
+                            p1, p2, p3 = st.columns(3)
+
+                            with p1:
+                                st.metric(
+                                    "Inclination",
+                                    f"{actual_inc:.2f}°",
+                                    delta=f"{inc_variance:+.2f}° vs plan"
+                                )
+                                st.caption(
+                                    f"Planned: {planned_inc:.2f}°"
+                                )
+
+                            with p2:
+                                st.metric(
+                                    "Azimuth",
+                                    f"{actual_azi:.2f}°",
+                                    delta=f"{azi_variance:+.2f}° vs plan"
+                                )
+                                st.caption(
+                                    f"Planned: {planned_azi:.2f}°"
+                                )
+
+                            with p3:
+                                if pd.notna(actual_dls):
+                                    st.metric(
+                                        "DLS",
+                                        f"{actual_dls:.2f}°/100 ft"
+                                    )
+                                else:
+                                    st.metric("DLS", "N/A")
+
+                            # Directional warning limits
+                            INC_WARNING = 2.0
+                            AZI_WARNING = 5.0
+                            DLS_WARNING = 3.0
+
+                            st.subheader("Directional Status")
+
+                            warnings = []
+
+                            if abs(inc_variance) > INC_WARNING:
+                                warnings.append(
+                                    f"Inclination is {inc_variance:+.2f}° from plan."
+                                )
+
+                            if abs(azi_variance) > AZI_WARNING:
+                                warnings.append(
+                                    f"Azimuth is {azi_variance:+.2f}° from plan."
+                                )
+
+                            if pd.notna(actual_dls) and actual_dls > DLS_WARNING:
+                                warnings.append(
+                                    f"DLS is {actual_dls:.2f}°/100 ft, "
+                                    f"above the {DLS_WARNING:.1f}°/100 ft warning limit."
+                                )
+
+                            if warnings:
+                                for message in warnings:
+                                    st.warning(message)
+                            else:
+                                st.success(
+                                    "Directional survey is within the current warning limits."
+                                )
 
             except Exception as e:
                 st.error(
-                    f"Could not read the directional survey: {e}"
+                    f"Could not process the directional survey: {e}"
                 )
-                latest_station = daily_survey_mapped.iloc[-1]
 
-st.subheader("Latest Actual Survey Station")
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    st.metric("MD", f"{latest_station['MD_ft']:,.1f} ft")
-
-with c2:
-    st.metric("TVD", f"{latest_station['TVD_ft']:,.1f} ft")
-
-with c3:
-    st.metric(
-        "Inclination",
-        f"{latest_station['Inclination_deg']:.2f}°"
-    )
-
-with c4:
-    st.metric(
-        "DLS",
-        f"{latest_station['DLS_calc_deg_per_100ft']:.2f}°/100 ft"
-    )
-                # -----------------------------------
-# Compare Actual vs Planned Directional
-# -----------------------------------
-
-actual_md = float(latest_station["MD_ft"])
-
-planned_inc = interp_by_md(
-    survey,
-    actual_md,
-    "Inclination_deg"
-)
-
-planned_azi = interp_by_md(
-    survey,
-    actual_md,
-    "Azimuth_deg"
-)
-
-actual_inc = float(
-    latest_station["Inclination_deg"]
-)
-
-actual_azi = float(
-    latest_station["Azimuth_deg"]
-)
-
-actual_dls = float(
-    latest_station["DLS_calc_deg_per_100ft"]
-)
-
-inc_variance = actual_inc - planned_inc
-azi_variance = actual_azi - planned_azi
-
-st.subheader("Directional Plan vs Actual")
-
-c1, c2, c3 = st.columns(3)
-
-with c1:
-    st.metric(
-        "Inclination",
-        f"{actual_inc:.2f}°",
-        delta=f"{inc_variance:+.2f}° vs plan"
-    )
-
-with c2:
-    st.metric(
-        "Azimuth",
-        f"{actual_azi:.2f}°",
-        delta=f"{azi_variance:+.2f}° vs plan"
-    )
-
-with c3:
-    st.metric(
-        "DLS",
-        f"{actual_dls:.2f}°/100 ft"
-    )
-    
-         # Directional warning limits
-INC_WARNING = 2.0
-AZI_WARNING = 5.0
-DLS_WARNING = 3.0
-
-st.subheader("Directional Status")
-
-if abs(inc_variance) > INC_WARNING:
-    st.warning(
-        f"Inclination is {inc_variance:+.2f}° from plan."
-    )
-
-if abs(azi_variance) > AZI_WARNING:
-    st.warning(
-        f"Azimuth is {azi_variance:+.2f}° from plan."
-    )
-
-if actual_dls > DLS_WARNING:
-    st.warning(
-        f"DLS is {actual_dls:.2f}°/100 ft, "
-        f"above the {DLS_WARNING:.1f}°/100 ft warning limit."
-    )
-
-if (
-    abs(inc_variance) <= INC_WARNING
-    and abs(azi_variance) <= AZI_WARNING
-    and actual_dls <= DLS_WARNING
-):
-    st.success(
-        "Directional survey is within the current warning limits."
-    )       
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
