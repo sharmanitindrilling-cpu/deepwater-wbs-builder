@@ -1,5 +1,7 @@
 import io
 import math
+import json
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -970,6 +972,197 @@ def extract_ddr_text(uploaded_file):
 
 
 # -----------------------------
+# Gemini Daily Report Agent
+# -----------------------------
+DDR_STRUCTURED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "report_date": {
+            "type": "string",
+            "description": "DDR report date exactly as stated in the report, if available."
+        },
+        "current_md_ft": {
+            "type": "number",
+            "description": "Latest/current measured depth in feet."
+        },
+        "current_tvd_ft": {
+            "type": "number",
+            "description": "Latest/current true vertical depth in feet, only if explicitly stated."
+        },
+        "hole_section": {
+            "type": "string",
+            "description": "Current hole section, for example 12-1/4 in or 8-1/2 in."
+        },
+        "current_operation": {
+            "type": "string",
+            "description": "Current operation at the end of the reporting period."
+        },
+        "next_operation": {
+            "type": "string",
+            "description": "Next planned operation explicitly stated in the DDR."
+        },
+        "mud_weight_ppg": {
+            "type": "number",
+            "description": "Current mud weight in ppg."
+        },
+        "mud_type": {
+            "type": "string",
+            "description": "Current drilling fluid type, such as SBM or WBM."
+        },
+        "losses_bbl_hr": {
+            "type": "number",
+            "description": "Current loss rate in bbl/hr, if explicitly stated."
+        },
+        "losses_24h_bbl": {
+            "type": "number",
+            "description": "Total losses during the reporting period in barrels, if explicitly stated."
+        },
+        "npt_hours_24h": {
+            "type": "number",
+            "description": "NPT hours during the reporting period."
+        },
+        "npt_category": {
+            "type": "string",
+            "description": "Primary NPT category or cause."
+        },
+        "casing_status": {
+            "type": "string",
+            "description": "Latest casing or liner status explicitly stated in the DDR."
+        },
+        "fit_lot_ppg": {
+            "type": "number",
+            "description": "Latest FIT or LOT result in ppg EMW, if explicitly stated."
+        },
+        "fit_lot_type": {
+            "type": "string",
+            "description": "FIT or LOT, if explicitly stated."
+        },
+        "key_events": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Important operational events from the reporting period."
+        }
+    }
+}
+
+
+def _streamlit_secret(name, default=None):
+    """Safely read a Streamlit secret without breaking local runs."""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def get_gemini_client():
+    """Create a Gemini client from Streamlit Secrets or environment variables."""
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise ImportError(
+            "The google-genai package is not installed. Add 'google-genai' to requirements.txt."
+        ) from exc
+
+    api_key = _streamlit_secret("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key not found. Add GEMINI_API_KEY to Streamlit Secrets."
+        )
+
+    return genai.Client(api_key=api_key)
+
+
+def extract_ddr_structured_with_gemini(ddr_text):
+    """
+    Extract a structured daily-well state from DDR text using Gemini Structured Output.
+    Missing information is left absent by Gemini and normalized to None locally.
+    """
+    if not ddr_text or not ddr_text.strip():
+        raise ValueError("DDR text is empty; Gemini extraction cannot run.")
+
+    try:
+        from google.genai import types
+    except ImportError as exc:
+        raise ImportError(
+            "The google-genai package is not installed. Add 'google-genai' to requirements.txt."
+        ) from exc
+
+    client = get_gemini_client()
+    model_name = (
+        _streamlit_secret("GEMINI_MODEL")
+        or os.getenv("GEMINI_MODEL")
+        or "gemini-2.5-flash"
+    )
+
+    # Keep a generous cap to avoid accidentally sending a very large converted PDF.
+    max_chars = 120000
+    report_text = ddr_text[:max_chars]
+
+    prompt = f"""
+You are the Daily Report Agent for a deepwater drilling well.
+Extract operational facts from the Daily Drilling Report below into the requested JSON schema.
+
+Rules:
+- Use ONLY information explicitly supported by the DDR text.
+- Do not guess, calculate, or infer missing engineering values.
+- Use the latest/current value when multiple depths or mud weights appear.
+- Current operation means the operation at the end of the reporting period.
+- Next operation must come from an explicit forward plan / next operation statement.
+- Keep casing_status concise but preserve the casing/liner size when stated.
+- FIT/LOT values must be reported only when the report clearly identifies them.
+- NPT hours must reflect the reporting period, not cumulative historical NPT, unless that is the only value explicitly stated.
+- key_events should contain concise operationally important events only.
+- If a field is not supported by the DDR, omit that field rather than inventing a value.
+
+DAILY DRILLING REPORT TEXT:
+----------------------------
+{report_text}
+----------------------------
+"""
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=DDR_STRUCTURED_SCHEMA,
+            temperature=0.1,
+        ),
+    )
+
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty response.")
+
+    data = json.loads(response.text)
+
+    # Normalize the result so the UI always has predictable keys.
+    defaults = {
+        "report_date": None,
+        "current_md_ft": None,
+        "current_tvd_ft": None,
+        "hole_section": None,
+        "current_operation": None,
+        "next_operation": None,
+        "mud_weight_ppg": None,
+        "mud_type": None,
+        "losses_bbl_hr": None,
+        "losses_24h_bbl": None,
+        "npt_hours_24h": None,
+        "npt_category": None,
+        "casing_status": None,
+        "fit_lot_ppg": None,
+        "fit_lot_type": None,
+        "key_events": [],
+    }
+    result = defaults.copy()
+    if isinstance(data, dict):
+        result.update(data)
+    if not isinstance(result.get("key_events"), list):
+        result["key_events"] = []
+    return result
+
+
+# -----------------------------
 # UI
 # -----------------------------
 st.title("Deepwater Wellbore Schematic Builder")
@@ -1070,6 +1263,15 @@ with tab0:
 
                     if ddr_text.strip():
                         st.success("Daily Drilling Report text extracted successfully.")
+
+                        # Run the Gemini Daily Report Agent after PDF text extraction.
+                        try:
+                            with st.spinner("Gemini Daily Report Agent is extracting DDR fields..."):
+                                daily_report_result = extract_ddr_structured_with_gemini(ddr_text)
+                            st.session_state["daily_report_agent_result"] = daily_report_result
+                            st.success("Daily Report Agent structured extraction completed.")
+                        except Exception as agent_error:
+                            st.error(f"Daily Report Agent could not run: {agent_error}")
                     else:
                         st.warning(
                             "The DDR PDF was opened, but no selectable text was found. "
@@ -1371,6 +1573,68 @@ with tab0:
                     f"Could not process the directional survey: {e}"
                 )
 
+
+    # -----------------------------------
+    # Daily Report Agent Review Panel
+    # -----------------------------------
+    if "daily_report_agent_result" in st.session_state:
+        result = st.session_state["daily_report_agent_result"]
+
+        st.divider()
+        st.subheader("Daily Report Agent Review")
+        st.caption(
+            "Review the Gemini-extracted DDR values before they are allowed to update the WBS. "
+            "This version does not automatically overwrite planned engineering data."
+        )
+
+        def _fmt_number(value, suffix="", decimals=1):
+            if value is None or pd.isna(value):
+                return "N/A"
+            try:
+                return f"{float(value):,.{decimals}f}{suffix}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            st.metric("Current MD", _fmt_number(result.get("current_md_ft"), " ft", 1))
+        with r2:
+            st.metric("Current TVD", _fmt_number(result.get("current_tvd_ft"), " ft", 1))
+        with r3:
+            st.metric("Mud Weight", _fmt_number(result.get("mud_weight_ppg"), " ppg", 2))
+        with r4:
+            st.metric("NPT (24 hr)", _fmt_number(result.get("npt_hours_24h"), " hr", 2))
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Report / Well Status**")
+            st.write(f"Report date: **{result.get('report_date') or 'N/A'}**")
+            st.write(f"Hole section: **{result.get('hole_section') or 'N/A'}**")
+            st.write(f"Mud type: **{result.get('mud_type') or 'N/A'}**")
+            st.write(f"Casing status: **{result.get('casing_status') or 'N/A'}**")
+            fit_type = result.get("fit_lot_type") or "FIT/LOT"
+            fit_value = _fmt_number(result.get("fit_lot_ppg"), " ppg EMW", 2)
+            st.write(f"{fit_type}: **{fit_value}**")
+
+        with right:
+            st.markdown("**Operations / Events**")
+            st.write(f"Current operation: **{result.get('current_operation') or 'N/A'}**")
+            st.write(f"Next operation: **{result.get('next_operation') or 'N/A'}**")
+            st.write(f"Loss rate: **{_fmt_number(result.get('losses_bbl_hr'), ' bbl/hr', 2)}**")
+            st.write(f"24 hr losses: **{_fmt_number(result.get('losses_24h_bbl'), ' bbl', 1)}**")
+            st.write(f"NPT category: **{result.get('npt_category') or 'N/A'}**")
+
+        st.markdown("**Key Events**")
+        events = result.get("key_events") or []
+        if events:
+            for event in events:
+                st.write(f"- {event}")
+        else:
+            st.write("No key events were extracted.")
+
+        with st.expander("View structured Gemini JSON"):
+            st.json(result)
+
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
@@ -1550,5 +1814,8 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
+
+
+
 
 
