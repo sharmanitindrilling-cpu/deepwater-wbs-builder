@@ -315,7 +315,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     from matplotlib.patches import Rectangle, Polygon
     from pathlib import Path
 
-    fig, ax = plt.subplots(figsize=(18, 20))
+    fig, ax = plt.subplots(figsize=(27, 20))
 
     def draw_shoe_symbol(ax, x_left, x_right, y, h=0.16, color='black', wedge_color='#c8b273'):
         bw = 0.07
@@ -323,9 +323,9 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         ax.add_patch(Rectangle((x_right, y - h), bw, h, facecolor=color, edgecolor=color, linewidth=0, zorder=7))
         tw = 0.11
         ax.add_patch(Polygon([(x_left, y - h), (x_left - tw, y), (x_left, y)], closed=True,
-                             facecolor=wedge_color, edgecolor=color, linewidth=0.6, zorder=8))
+                             facecolor=wedge_color, edgecolor=color, linewidth=1.0, zorder=8))
         ax.add_patch(Polygon([(x_right, y - h), (x_right + tw, y), (x_right, y)], closed=True,
-                             facecolor=wedge_color, edgecolor=color, linewidth=0.6, zorder=8))
+                             facecolor=wedge_color, edgecolor=color, linewidth=1.0, zorder=8))
 
     def draw_tol_symbol(ax, liner_left, liner_right, outer_left, outer_right, y, h=0.22, color='black'):
         hanger_h = h * 0.38
@@ -390,16 +390,15 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         if od is None or pd.isna(od):
             return 1.3
         ratio = max(float(od) / max_od, 0.05)
-        return 0.78 + 2.55 * (ratio ** 0.48)
+        return 1.17 + 3.825 * (ratio ** 0.48)
 
     # Layout
     x_geo = -12.0
     x_pp = -9.2
     x_mud = -6.2
-    x_well = -2.1
+    x_well = -2.6
     x_hole = 1.45
-    x_casing = 4.0
-    x_fit = 11.6
+    x_casing = 3.25
     left_edge = -14.2
     right_edge = 14.8
 
@@ -419,10 +418,10 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     bh_x = well.get('BottomHole_X', '')
     bh_y = well.get('BottomHole_Y', '')
 
-    ax.text(0, title_y, well_name, ha='center', va='center', fontsize=14, fontweight='bold')
+    ax.text(0, title_y, well_name, ha='center', va='center', fontsize=28, fontweight='bold')
     if prospect and prospect != 'nan':
-        ax.text(0, title_y + 0.22, prospect, ha='center', fontsize=9.5)
-    ax.text(0, title_y + 0.40, 'WELLBORE SCHEMATIC', ha='center', fontsize=8.5, style='italic')
+        ax.text(0, title_y + 0.22, prospect, ha='center', fontsize=19)
+    ax.text(0, title_y + 0.40, 'WELLBORE SCHEMATIC', ha='center', fontsize=17, style='italic')
 
     coord_lines = []
     if surf_x != '' or surf_y != '':
@@ -430,7 +429,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     if bh_x != '' or bh_y != '':
         coord_lines.append(f'Bottom Hole Location: X={bh_x}, Y={bh_y}')
     if coord_lines:
-        ax.text(left_edge + 4.35, coord_y, '\n'.join(coord_lines), ha='left', va='center', fontsize=8.1,
+        ax.text(left_edge + 4.35, coord_y, '\n'.join(coord_lines), ha='left', va='center', fontsize=16.2,
                 bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
 
     logo_path = Path(__file__).with_name('eni_logo.png')
@@ -447,7 +446,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         f'Mudline: {mudline_md:,.0f} ft MD\n'
         f'TD: {td_md:,.0f} ft MD'
     )
-    ax.text(right_edge, summary_y, summary, ha='right', va='center', fontsize=8.3)
+    ax.text(right_edge, summary_y, summary, ha='right', va='center', fontsize=16.6)
 
     headers = [
         (x_geo, 'GEOLOGICAL TOPS'),
@@ -455,18 +454,17 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         (x_mud, 'MUD'),
         (x_well, 'WELLBORE'),
         (x_hole, 'HOLE'),
-        (x_casing, 'CASING'),
-        (x_fit, 'FIT / LOT'),
+        (x_casing, 'CASING / FIT-LOT'),
     ]
     for x, txt in headers:
-        ax.text(x, header_y, txt, ha='center', va='center', fontsize=9.5, fontweight='bold')
+        ax.text(x, header_y, txt, ha='center', va='center', fontsize=19, fontweight='bold')
 
-    separators = [-10.45, -7.75, -4.65, -0.85, 2.15, 9.85]
+    separators = [-10.45, -7.75, -4.65, -0.85, 2.15]
     for x in separators:
-        ax.vlines(x, header_y + 0.15, section_bottom_y + 0.35, linewidth=0.65, alpha=0.45)
+        ax.vlines(x, header_y + 0.15, section_bottom_y + 0.35, linewidth=1.1, alpha=0.75)
 
-    ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=8)
-    ax.plot([x_well - 1.8, x_well + 1.8], [0.0, 0.0], color='black', linewidth=1.1)
+    ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=16)
+    ax.plot([x_well - 1.8, x_well + 1.8], [0.0, 0.0], color='black', linewidth=1.8)
 
     # Geometry
     row_geometry = []
@@ -495,8 +493,8 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
                                    ann_gap + overlap, shoe_y - cement_start_y,
                                    facecolor='dimgray', alpha=0.70, edgecolor='none', zorder=1))
 
-        ax.plot([x_left, x_left], [top_y, shoe_y], color='black', linewidth=1.8, zorder=6)
-        ax.plot([x_right, x_right], [top_y, shoe_y], color='black', linewidth=1.8, zorder=6)
+        ax.plot([x_left, x_left], [top_y, shoe_y], color='black', linewidth=2.8, zorder=6)
+        ax.plot([x_right, x_right], [top_y, shoe_y], color='black', linewidth=2.8, zorder=6)
 
         row_geometry.append({
             'od': float(od) if pd.notna(od) else np.nan,
@@ -553,7 +551,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             pp_text = f'{float(ppmax):.1f}\nppg'
         else:
             pp_text = '-'
-        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=7.8)
+        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=15.6)
 
         mwmin = srow.get('Mud_Weight_Min_ppg', row.get('Mud_Weight_Min_ppg', np.nan))
         mwmax = srow.get('Mud_Weight_Max_ppg', row.get('Mud_Weight_Max_ppg', np.nan))
@@ -563,11 +561,11 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             mud_lines.append(f'MW {float(mwmin):.1f}-{float(mwmax):.1f} ppg')
         if mudtype and mudtype.lower() != 'nan':
             mud_lines.append(mudtype)
-        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=7.8)
+        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=15.6)
 
         hole = row.get('Hole_Size_in', np.nan)
         hole_text = f'{float(hole):g}"' if pd.notna(hole) else '-'
-        ax.text(x_hole, section_y, hole_text, ha='center', va='center', fontsize=8.2)
+        ax.text(x_hole, section_y, hole_text, ha='center', va='center', fontsize=16.4)
 
         od = row.get('Casing_OD_in', np.nan)
         cid = row.get('Casing_ID_in', np.nan)
@@ -613,13 +611,14 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         if pd.notna(max_inc):
             spec_lines.append(f'Max Inclination {float(max_inc):.1f}°')
 
-        ax.text(x_casing, section_y, '\n'.join(spec_lines), ha='left', va='center', fontsize=7.2,
-                bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='0.55'))
-
+        fit_type = str(srow.get('FIT_LOT_Type', '') or '')
         fit_val = srow.get('FIT_LOT_Value', np.nan)
-        fit_text = f'{float(fit_val):.2f}\nppg EMW' if pd.notna(fit_val) else '-'
-        ax.text(x_fit, section_y, fit_text, ha='center', va='center', fontsize=7.9,
-                bbox=dict(boxstyle='round,pad=0.20', facecolor='white', edgecolor='0.55'))
+        if pd.notna(fit_val):
+            label = fit_type if fit_type and fit_type.lower() != 'nan' else 'FIT/LOT'
+            spec_lines.append(f'{label} {float(fit_val):.2f} ppg EMW')
+
+        ax.text(x_casing, section_y, '\n'.join(spec_lines), ha='left', va='center', fontsize=14.4,
+                bbox=dict(boxstyle='round,pad=0.32', facecolor='white', edgecolor='0.35', linewidth=1.3))
 
     if geocalc is not None and not geocalc.empty:
         g = geocalc.dropna(subset=['MD_ft']).sort_values('MD_ft').copy()
@@ -641,10 +640,10 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
                 row = g.iloc[pair_idx]
                 ax.plot([-10.58, -10.45], [y_actual, y_actual], color='black', linewidth=0.75)
                 txt = f"{row['Formation_Name']}\nMD {row['MD_ft']:,.0f} | TVD {row['TVD_ft']:,.0f}"
-                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=7.05)
+                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=14.1)
 
     td_y = md_to_y(td_md)
-    ax.text(x_well + 1.45, td_y, f'TD {td_md:,.0f} MD', va='center', fontsize=8.5, fontweight='bold')
+    ax.text(x_well + 1.45, td_y, f'TD {td_md:,.0f} MD', va='center', fontsize=17, fontweight='bold')
 
     ax.set_xlim(left_edge, right_edge)
     ax.set_ylim(section_bottom_y + 0.55, -1.75)
@@ -1817,5 +1816,6 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
+
 
 
