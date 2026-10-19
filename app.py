@@ -457,14 +457,21 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         (x_casing, 'CASING / FIT-LOT'),
     ]
     for x, txt in headers:
-        ax.text(x, header_y, txt, ha='center', va='center', fontsize=19, fontweight='bold')
+        ax.text(x, header_y, txt, ha='center', va='center', fontsize=9.5, fontweight='bold')
 
     separators = [-10.45, -7.75, -4.65, -0.85, 2.15]
     for x in separators:
         ax.vlines(x, header_y + 0.15, section_bottom_y + 0.35, linewidth=1.1, alpha=0.75)
 
-    ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=16)
+    ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=8)
     ax.plot([x_well - 1.8, x_well + 1.8], [0.0, 0.0], color='black', linewidth=1.8)
+
+    # Dashed shoe-depth reference lines across the WBS.
+    shoe_line_depths = sorted(set(float(v) for v in c['Shoe_MD_ft'].dropna().tolist()))
+    for shoe_md_line in shoe_line_depths:
+        y_line = md_to_y(shoe_md_line)
+        ax.hlines(y_line, left_edge + 0.45, right_edge - 0.45,
+                  colors='0.35', linestyles=(0, (5, 4)), linewidth=1.0, alpha=0.75, zorder=0.4)
 
     # Geometry
     row_geometry = []
@@ -542,6 +549,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         top_md = float(row['Top_MD_ft'])
         shoe_md = float(row['Shoe_MD_ft'])
         section_y = md_to_y((top_md + shoe_md) / 2.0)
+        casing_label_y = md_to_y(shoe_md)
 
         ppmin = srow.get('Pore_Pressure_Min_ppg', row.get('Pore_Pressure_Min_ppg', np.nan))
         ppmax = srow.get('Pore_Pressure_Max_ppg', row.get('Pore_Pressure_Max_ppg', np.nan))
@@ -551,7 +559,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             pp_text = f'{float(ppmax):.1f}\nppg'
         else:
             pp_text = '-'
-        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=15.6)
+        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=7.8)
 
         mwmin = srow.get('Mud_Weight_Min_ppg', row.get('Mud_Weight_Min_ppg', np.nan))
         mwmax = srow.get('Mud_Weight_Max_ppg', row.get('Mud_Weight_Max_ppg', np.nan))
@@ -561,11 +569,11 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             mud_lines.append(f'MW {float(mwmin):.1f}-{float(mwmax):.1f} ppg')
         if mudtype and mudtype.lower() != 'nan':
             mud_lines.append(mudtype)
-        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=15.6)
+        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=7.8)
 
         hole = row.get('Hole_Size_in', np.nan)
         hole_text = f'{float(hole):g}"' if pd.notna(hole) else '-'
-        ax.text(x_hole, section_y, hole_text, ha='center', va='center', fontsize=16.4)
+        ax.text(x_hole, section_y, hole_text, ha='center', va='center', fontsize=8.2)
 
         od = row.get('Casing_OD_in', np.nan)
         cid = row.get('Casing_ID_in', np.nan)
@@ -617,7 +625,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             label = fit_type if fit_type and fit_type.lower() != 'nan' else 'FIT/LOT'
             spec_lines.append(f'{label} {float(fit_val):.2f} ppg EMW')
 
-        ax.text(x_casing, section_y, '\n'.join(spec_lines), ha='left', va='center', fontsize=14.4,
+        ax.text(x_casing, casing_label_y, '\n'.join(spec_lines), ha='left', va='center', fontsize=14.4,
                 bbox=dict(boxstyle='round,pad=0.32', facecolor='white', edgecolor='0.35', linewidth=1.3))
 
     if geocalc is not None and not geocalc.empty:
@@ -640,7 +648,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
                 row = g.iloc[pair_idx]
                 ax.plot([-10.58, -10.45], [y_actual, y_actual], color='black', linewidth=0.75)
                 txt = f"{row['Formation_Name']}\nMD {row['MD_ft']:,.0f} | TVD {row['TVD_ft']:,.0f}"
-                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=14.1)
+                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=7.05)
 
     td_y = md_to_y(td_md)
     ax.text(x_well + 1.45, td_y, f'TD {td_md:,.0f} MD', va='center', fontsize=17, fontweight='bold')
@@ -1816,6 +1824,5 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
-
 
 
