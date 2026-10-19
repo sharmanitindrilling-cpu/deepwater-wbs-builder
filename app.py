@@ -1,0 +1,1888 @@
+mport io
+import math
+import json
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+from pypdf import PdfReader
+
+st.set_page_config(page_title="Deepwater WBS Builder", layout="wide")
+
+# -----------------------------
+# Core engineering calculations
+# -----------------------------
+def minimum_curvature_tvd(df):
+    """Calculate TVD, Northing, Easting and DLS from MD/Inc/Azi survey."""
+    d = df.sort_values("MD_ft").reset_index(drop=True).copy()
+    n = len(d)
+    tvd = np.zeros(n)
+    north = np.zeros(n)
+    east = np.zeros(n)
+    dls = np.zeros(n)
+
+    # Assumption: first station TVD equals first MD unless supplied.
+    tvd[0] = d.loc[0, "TVD_ft_optional"] if "TVD_ft_optional" in d and pd.notna(d.loc[0, "TVD_ft_optional"]) else d.loc[0, "MD_ft"]
+
+    for i in range(1, n):
+        md1, md2 = float(d.loc[i-1, "MD_ft"]), float(d.loc[i, "MD_ft"])
+        inc1 = math.radians(float(d.loc[i-1, "Inclination_deg"]))
+        inc2 = math.radians(float(d.loc[i, "Inclination_deg"]))
+        azi1 = math.radians(float(d.loc[i-1, "Azimuth_deg"]))
+        azi2 = math.radians(float(d.loc[i, "Azimuth_deg"]))
+        dmd = md2 - md1
+
+        cos_dogleg = (
+            math.cos(inc1) * math.cos(inc2)
+            + math.sin(inc1) * math.sin(inc2) * math.cos(azi2 - azi1)
+        )
+        cos_dogleg = max(-1.0, min(1.0, cos_dogleg))
+        dogleg = math.acos(cos_dogleg)
+        rf = 1.0 if abs(dogleg) < 1e-12 else (2.0 / dogleg) * math.tan(dogleg / 2.0)
+
+        dtvd = 0.5 * dmd * (math.cos(inc1) + math.cos(inc2)) * rf
+        dn = 0.5 * dmd * (math.sin(inc1)*math.cos(azi1) + math.sin(inc2)*math.cos(azi2)) * rf
+        de = 0.5 * dmd * (math.sin(inc1)*math.sin(azi1) + math.sin(inc2)*math.sin(azi2)) * rf
+
+        tvd[i] = tvd[i-1] + dtvd
+        north[i] = north[i-1] + dn
+        east[i] = east[i-1] + de
+        dls[i] = math.degrees(dogleg) * 100.0 / dmd if dmd else 0.0
+
+    d["TVD_calc_ft"] = tvd
+    d["Northing_calc_ft"] = north
+    d["Easting_calc_ft"] = east
+    d["DLS_calc_deg_per_100ft"] = dls
+
+    # Prefer supplied TVD if complete; otherwise use minimum-curvature TVD.
+    if "TVD_ft_optional" in d.columns and d["TVD_ft_optional"].notna().all():
+        d["TVD_ft"] = d["TVD_ft_optional"].astype(float)
+    else:
+        d["TVD_ft"] = d["TVD_calc_ft"]
+    return d
+
+
+def interp_by_md(survey, md, column):
+    x = survey["MD_ft"].to_numpy(float)
+    y = survey[column].to_numpy(float)
+    if md < x.min() or md > x.max():
+        return np.nan
+    return float(np.interp(md, x, y))
+
+
+def md_solutions_from_tvd(survey, target_tvd):
+    """Return all approximate MD solutions where the survey crosses target TVD."""
+    md = survey["MD_ft"].to_numpy(float)
+    tvd = survey["TVD_ft"].to_numpy(float)
+    sols = []
+    for i in range(len(md)-1):
+        a, b = tvd[i], tvd[i+1]
+        if target_tvd == a:
+            sols.append(float(md[i]))
+        if (target_tvd-a)*(target_tvd-b) <= 0 and a != b:
+            f = (target_tvd-a)/(b-a)
+            if 0 <= f <= 1:
+                sols.append(float(md[i] + f*(md[i+1]-md[i])))
+    # de-duplicate
+    out = []
+    for x in sols:
+        if not out or abs(x-out[-1]) > 0.1:
+            out.append(x)
+    return out
+
+
+def temp_at_tvd(temp_df, tvd):
+    t = temp_df.dropna(subset=["TVD_ft","Temperature_F"]).sort_values("TVD_ft")
+    if t.empty or tvd < t["TVD_ft"].min() or tvd > t["TVD_ft"].max():
+        return np.nan
+    return float(np.interp(tvd, t["TVD_ft"], t["Temperature_F"]))
+
+
+
+
+
+def calculate_shoe_data(casing, survey, temp, well_info, fitlot):
+    rkb = float(well_info.get("RKB", 0) or 0)
+    out = []
+
+    for _, row in casing.dropna(subset=["String_ID","Shoe_MD_ft"]).iterrows():
+        md = float(row["Shoe_MD_ft"])
+        tvd = interp_by_md(survey, md, "TVD_ft")
+        inc = interp_by_md(survey, md, "Inclination_deg")
+        azi = interp_by_md(survey, md, "Azimuth_deg")
+
+        subset = survey[survey["MD_ft"] <= md]
+        max_inc = float(subset["Inclination_deg"].max()) if not subset.empty else np.nan
+        temperature = temp_at_tvd(temp, tvd) if pd.notna(tvd) else np.nan
+
+        top_md = float(row["Top_MD_ft"]) if pd.notna(row.get("Top_MD_ft")) else np.nan
+        top_tvd = interp_by_md(survey, top_md, "TVD_ft") if pd.notna(top_md) else np.nan
+        toc_md = float(row["TOC_MD_ft"]) if pd.notna(row.get("TOC_MD_ft")) else np.nan
+        toc_tvd = interp_by_md(survey, toc_md, "TVD_ft") if pd.notna(toc_md) else np.nan
+
+        tests = fitlot[fitlot["String_ID"] == row["String_ID"]] if not fitlot.empty else pd.DataFrame()
+        test_type = tests.iloc[-1]["Test_Type"] if not tests.empty else ""
+        test_val = tests.iloc[-1]["Result_EMW_ppg"] if not tests.empty else np.nan
+
+        out.append({
+            "String_ID": row["String_ID"],
+            "String_Name": row["String_Name"],
+            "Hole_Size_in": row.get("Hole_Size_in", np.nan),
+            "Casing_OD_in": row.get("Casing_OD_in", np.nan),
+            "Casing_ID_in": row.get("Casing_ID_in", np.nan),
+            "Drift_in": row.get("Drift_in", np.nan),
+            "Casing_Grade": row.get("Casing_Grade", ""),
+            "Casing_Top_MD_ft": top_md,
+            "Casing_Top_TVD_ft": top_tvd,
+            "TOC_MD_ft": toc_md,
+            "TOC_TVD_ft": toc_tvd,
+            "Shoe_MD_ft": md,
+            "Shoe_TVD_ft": tvd,
+            "Shoe_TVDSS_ft": tvd - rkb if pd.notna(tvd) else np.nan,
+            "Inc_at_Shoe_deg": inc,
+            "Max_Inc_to_Shoe_deg": max_inc,
+            "Azimuth_at_Shoe_deg": azi,
+            "Temperature_F": temperature,
+            "FIT_LOT_Type": test_type,
+            "FIT_LOT_Value": test_val,
+            "Mud_Weight_Min_ppg": row.get("Mud_Weight_Min_ppg", np.nan),
+            "Mud_Weight_Max_ppg": row.get("Mud_Weight_Max_ppg", np.nan),
+            "Pore_Pressure_Min_ppg": row.get("Pore_Pressure_Min_ppg", np.nan),
+            "Pore_Pressure_Max_ppg": row.get("Pore_Pressure_Max_ppg", np.nan),
+            "Mud_Type": row.get("Mud_Type", ""),
+        })
+
+    return pd.DataFrame(out)
+
+
+def calculate_geo_data(geo, survey, temp, rkb):
+    out = []
+    for _, row in geo.dropna(subset=["Top_ID","Formation_Name","Input_Depth_ft"]).iterrows():
+        typ = str(row["Input_Depth_Type"]).strip().upper()
+        depth = float(row["Input_Depth_ft"])
+        if typ == "MD":
+            md = depth
+            tvd = interp_by_md(survey, md, "TVD_ft")
+        else:
+            sols = md_solutions_from_tvd(survey, depth)
+            md = sols[0] if len(sols) == 1 else (sols[0] if sols else np.nan)
+            tvd = depth
+        inc = interp_by_md(survey, md, "Inclination_deg") if pd.notna(md) else np.nan
+        azi = interp_by_md(survey, md, "Azimuth_deg") if pd.notna(md) else np.nan
+        out.append({
+            "Top_ID": row["Top_ID"],
+            "Formation_Name": row["Formation_Name"],
+            "MD_ft": md,
+            "TVD_ft": tvd,
+            "TVDSS_ft": tvd - rkb if pd.notna(tvd) else np.nan,
+            "Inclination_deg": inc,
+            "Azimuth_deg": azi,
+            "Temperature_F": temp_at_tvd(temp, tvd) if pd.notna(tvd) else np.nan,
+            "Category": row.get("Category",""),
+        })
+    return pd.DataFrame(out)
+
+
+# -----------------------------
+# Workbook import/export helpers
+# -----------------------------
+def read_workbook(file):
+    xls = pd.ExcelFile(file)
+    sheets = {name: pd.read_excel(xls, sheet_name=name) for name in xls.sheet_names}
+
+    wi = sheets["Well_Info"].iloc[:, :4].copy()
+    wi.columns = ["Field","Value","Unit","Notes"]
+    wi = wi.dropna(subset=["Field"])
+    well = dict(zip(wi["Field"], wi["Value"]))
+
+    casing = sheets["Casing_Program"].copy()
+    survey = sheets["Directional_Survey"].copy()
+    geo = sheets["Geological_Tops"].copy()
+    temp = sheets["Temperature_Gradient"].copy()
+    fitlot = sheets["FIT_LOT"].copy()
+
+    # Template tables begin at row 3; remove empty/title rows if pandas captured them.
+    def normalize(df, expected_header):
+        if expected_header in df.columns:
+            return df
+        raw = pd.read_excel(file, sheet_name=df.attrs.get("sheet_name",""), header=None)
+        return df
+
+    # The template's third Excel row is the header, so re-read with header=2.
+    casing = pd.read_excel(file, sheet_name="Casing_Program", header=2)
+    survey = pd.read_excel(file, sheet_name="Directional_Survey", header=2)
+    geo = pd.read_excel(file, sheet_name="Geological_Tops", header=2)
+    temp = pd.read_excel(file, sheet_name="Temperature_Gradient", header=2)
+    fitlot = pd.read_excel(file, sheet_name="FIT_LOT", header=2)
+
+    return well, casing, survey, geo, temp, fitlot
+
+
+
+def make_output_excel(well, casing, survey, geo, temp, fitlot, shoes, geocalc):
+    bio = io.BytesIO()
+
+    def clean_value(value):
+        if value is None:
+            return ""
+
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+
+        if isinstance(value, (list, dict, tuple, set)):
+            return str(value)
+
+        if isinstance(value, np.generic):
+            return value.item()
+
+        return value
+
+    def clean_dataframe(df):
+        df = df.copy()
+        for col in df.columns:
+            df[col] = df[col].map(clean_value)
+        return df
+
+    well_df = pd.DataFrame({
+        "Field": [str(k) for k in well.keys()],
+        "Value": [clean_value(v) for v in well.values()]
+    })
+
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+        clean_dataframe(well_df).to_excel(
+            writer, sheet_name="Well_Info", index=False
+        )
+
+        clean_dataframe(casing).to_excel(
+            writer, sheet_name="Casing_Program", index=False
+        )
+
+        clean_dataframe(survey).to_excel(
+            writer, sheet_name="Directional_Survey", index=False
+        )
+
+        clean_dataframe(geo).to_excel(
+            writer, sheet_name="Geological_Tops", index=False
+        )
+
+        clean_dataframe(temp).to_excel(
+            writer, sheet_name="Temperature_Gradient", index=False
+        )
+
+        clean_dataframe(fitlot).to_excel(
+            writer, sheet_name="FIT_LOT", index=False
+        )
+
+        clean_dataframe(shoes).to_excel(
+            writer, sheet_name="Calculated_Shoe_Data", index=False
+        )
+
+        clean_dataframe(geocalc).to_excel(
+            writer, sheet_name="Calculated_Geo_Data", index=False
+        )
+
+    bio.seek(0)
+    return bio.getvalue()
+
+
+# -----------------------------
+# Schematic plotting
+# -----------------------------
+
+
+
+
+
+
+
+
+
+def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
+    """
+    Conventional WBS schematic - deliberately NOT TO SCALE.
+
+    Design goals:
+    - dedicated Well_Name from Well_Info
+    - equal visual spacing between hole sections for readability
+    - PP, Mud, and casing/FIT-LOT annotations aligned by hole section
+    - casing widths based on OD so nested strings remain visually correct
+    - liner-hanger parent casing chosen by geometric containment, not row order
+    """
+    from matplotlib.patches import Rectangle, Polygon
+    from pathlib import Path
+
+    fig, ax = plt.subplots(figsize=(16, 20))
+
+    def draw_shoe_symbol(ax, x_left, x_right, y, h=0.18, color='black', wedge_color='#c8b273'):
+        bw = 0.07
+        ax.add_patch(Rectangle((x_left - bw, y - h), bw, h, facecolor=color, edgecolor=color, linewidth=0, zorder=7))
+        ax.add_patch(Rectangle((x_right, y - h), bw, h, facecolor=color, edgecolor=color, linewidth=0, zorder=7))
+        tw = 0.10
+        ax.add_patch(Polygon([(x_left, y - h), (x_left - tw, y), (x_left, y)], closed=True,
+                             facecolor=wedge_color, edgecolor=color, linewidth=0.6, zorder=8))
+        ax.add_patch(Polygon([(x_right, y - h), (x_right + tw, y), (x_right, y)], closed=True,
+                             facecolor=wedge_color, edgecolor=color, linewidth=0.6, zorder=8))
+
+    def draw_tol_symbol(ax, liner_left, liner_right, outer_left, outer_right, y, h=0.22, color='black'):
+        hanger_h = h * 0.38
+        hanger_top = y - hanger_h * 0.60
+        overlap = 0.025
+
+        ax.add_patch(Rectangle(
+            (outer_left - overlap, hanger_top),
+            max((liner_left + overlap) - (outer_left - overlap), 0.03),
+            hanger_h,
+            facecolor=color, edgecolor=color, linewidth=0, zorder=9
+        ))
+        ax.add_patch(Rectangle(
+            (liner_right - overlap, hanger_top),
+            max((outer_right + overlap) - (liner_right - overlap), 0.03),
+            hanger_h,
+            facecolor=color, edgecolor=color, linewidth=0, zorder=9
+        ))
+
+        # Compact stepped shoulders beside the liner wall.
+        step_h = hanger_h * 0.32
+        step_w = min(max((liner_left - outer_left) * 0.28, 0.05), 0.15)
+        ax.add_patch(Rectangle((liner_left - step_w, hanger_top - step_h * 0.15),
+                               step_w + overlap, step_h,
+                               facecolor=color, edgecolor=color, linewidth=0, zorder=10))
+        ax.add_patch(Rectangle((liner_right - overlap, hanger_top - step_h * 0.15),
+                               step_w + overlap, step_h,
+                               facecolor=color, edgecolor=color, linewidth=0, zorder=10))
+
+    # -----------------------------
+    # Core well / section data
+    # -----------------------------
+    rkb = float(well.get('RKB', 0) or 0)
+    water_depth = float(well.get('Water_Depth', 0) or 0)
+    mudline_md = float(well.get('Mudline_TVD_RKB', water_depth + rkb) or (water_depth + rkb))
+
+    c = casing.dropna(subset=['Top_MD_ft', 'Shoe_MD_ft']).copy()
+    if c.empty:
+        ax.text(0.5, 0.5, 'No casing program available.', transform=ax.transAxes,
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        return fig
+
+    # Prefer explicit Display_Order, then casing OD.  This ensures 9-7/8-ish casing
+    # is drawn before 7-5/8 and 7-in liners.
+    if 'Display_Order' in c.columns:
+        c['_display_order'] = pd.to_numeric(c['Display_Order'], errors='coerce')
+    else:
+        c['_display_order'] = np.nan
+    c['_od_sort'] = pd.to_numeric(c.get('Casing_OD_in'), errors='coerce')
+    c = c.sort_values(['_display_order', '_od_sort'], ascending=[True, False], na_position='last').reset_index(drop=True)
+
+    n_sections = len(c)
+    td_md = float(well.get('Planned_TD_MD', c['Shoe_MD_ft'].astype(float).max()) or c['Shoe_MD_ft'].astype(float).max())
+
+    # Visual row system: every hole section gets equal vertical space.
+    # This is intentionally not a depth scale.
+    section_top_y = 0.0
+    section_bottom_y = float(n_sections)
+
+    # Map real MD to schematic Y using casing shoe anchors, preserving sequence but not scale.
+    # Duplicate shoe depths are allowed; the last duplicate controls deeper mapping.
+    shoe_depths = [float(x) for x in c['Shoe_MD_ft'].tolist()]
+    depth_to_y = {mudline_md: 0.0}
+    for i, d in enumerate(shoe_depths, start=1):
+        depth_to_y[d] = float(i)
+
+    anchor_depths = sorted(depth_to_y.keys())
+    anchor_y = [depth_to_y[d] for d in anchor_depths]
+
+    def md_to_y(md):
+        if md is None or pd.isna(md):
+            return np.nan
+        md = float(md)
+        if md <= anchor_depths[0]:
+            return anchor_y[0]
+        if md >= anchor_depths[-1]:
+            if td_md > anchor_depths[-1]:
+                frac = (md - anchor_depths[-1]) / max(td_md - anchor_depths[-1], 1.0)
+                return anchor_y[-1] + frac * max(section_bottom_y - anchor_y[-1], 0.5)
+            return anchor_y[-1]
+        return float(np.interp(md, np.asarray(anchor_depths, float), np.asarray(anchor_y, float)))
+
+    # Width is based on actual casing OD, not row index.
+    od_vals = pd.to_numeric(c['Casing_OD_in'], errors='coerce').astype(float)
+    max_od = float(np.nanmax(od_vals)) if np.isfinite(od_vals).any() else 1.0
+
+    def casing_width(od):
+        if od is None or pd.isna(od):
+            return 1.4
+        ratio = max(float(od) / max_od, 0.05)
+        return 0.85 + 2.45 * (ratio ** 0.45)
+
+    # -----------------------------
+    # Layout
+    # -----------------------------
+    x_geo = -9.2
+    x_pp = -6.35
+    x_mud = -3.15
+    x_well = 0.45
+    x_info = 6.15
+    left_edge = -11.5
+    right_edge = 11.9
+
+    header_y = -0.45
+    title_y = -1.46
+    coord_y = -0.77
+    summary_y = -1.10
+
+    well_name_raw = well.get('Well_Name', '')
+    well_name = str(well_name_raw).strip() if pd.notna(well_name_raw) else ''
+    if not well_name or well_name.lower() == 'nan':
+        well_name = 'ENTER WELL NAME IN Well_Info → Well_Name'
+
+    prospect = str(well.get('Field_Prospect', '') or '')
+    surf_x = well.get('Surface_X', '')
+    surf_y = well.get('Surface_Y', '')
+    bh_x = well.get('BottomHole_X', '')
+    bh_y = well.get('BottomHole_Y', '')
+
+    ax.text(0, title_y, well_name, ha='center', va='center', fontsize=14, fontweight='bold')
+    if prospect and prospect != 'nan':
+        ax.text(0, title_y + 0.22, prospect, ha='center', fontsize=9.5)
+    ax.text(0, title_y + 0.40, 'WELLBORE SCHEMATIC - NOT TO SCALE', ha='center', fontsize=8.5, style='italic')
+
+    coord_lines = []
+    if surf_x != '' or surf_y != '':
+        coord_lines.append(f'Surface Location: X={surf_x}, Y={surf_y}')
+    if bh_x != '' or bh_y != '':
+        coord_lines.append(f'Bottom Hole Location: X={bh_x}, Y={bh_y}')
+    if coord_lines:
+        ax.text(left_edge + 4.3, coord_y, '\n'.join(coord_lines), ha='left', va='center', fontsize=8.1,
+                bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
+
+    logo_path = Path(__file__).with_name('eni_logo.png')
+    if logo_path.exists():
+        try:
+            logo = plt.imread(str(logo_path))
+            ax.imshow(logo, extent=[left_edge + 0.45, left_edge + 2.25, -1.60, -0.76],
+                      aspect='auto', zorder=0)
+        except Exception:
+            pass
+
+    summary = (
+        f'Water Depth: {water_depth:,.0f} ft\n'
+        f'RKB: {rkb:,.0f} ft\n'
+        f'Mudline: {mudline_md:,.0f} ft MD\n'
+        f'TD: {td_md:,.0f} ft MD'
+    )
+    ax.text(right_edge, summary_y, summary, ha='right', va='center', fontsize=8.3)
+
+    headers = [
+        (x_geo, 'GEOLOGICAL TOPS'),
+        (x_pp, 'PORE PRESSURE'),
+        (x_mud, 'MUD'),
+        (x_well, 'WELLBORE'),
+        (x_info, 'HOLE / CASING / FIT-LOT'),
+    ]
+    for x, txt in headers:
+        ax.text(x, header_y, txt, ha='center', va='center', fontsize=9.5, fontweight='bold')
+
+    separators = [-7.75, -4.9, -1.45, 2.30]
+    for x in separators:
+        ax.vlines(x, header_y + 0.15, section_bottom_y + 0.35, linewidth=0.65, alpha=0.45)
+
+    # Mudline label and short reference line only.
+    ax.text(x_geo, 0.04, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=8)
+    ax.plot([x_well - 1.85, x_well + 1.85], [0.0, 0.0], color='black', linewidth=1.1)
+
+    # -----------------------------
+    # Casing / cement geometry
+    # -----------------------------
+    row_geometry = []
+    for i, row in c.iterrows():
+        od = row.get('Casing_OD_in', np.nan)
+        width = casing_width(od)
+        x_left = x_well - width / 2
+        x_right = x_well + width / 2
+
+        top_md = float(row['Top_MD_ft'])
+        shoe_md = float(row['Shoe_MD_ft'])
+        toc_md = float(row['TOC_MD_ft']) if pd.notna(row.get('TOC_MD_ft')) else np.nan
+
+        top_y = md_to_y(top_md)
+        shoe_y = float(i + 1)   # one visual row per hole section
+        toc_y = md_to_y(toc_md) if pd.notna(toc_md) else np.nan
+
+        # Cement annulus only, visually touching casing wall.
+        cement_start_y = max(top_y, toc_y) if pd.notna(toc_y) else top_y
+        annulus_outer = width + 0.26
+        ann_gap = (annulus_outer - width) / 2.0
+        overlap = 0.018
+        if shoe_y > cement_start_y:
+            ax.add_patch(Rectangle((x_well - annulus_outer/2, cement_start_y),
+                                   ann_gap + overlap, shoe_y - cement_start_y,
+                                   facecolor='dimgray', alpha=0.70, edgecolor='none', zorder=1))
+            ax.add_patch(Rectangle((x_well + width/2 - overlap, cement_start_y),
+                                   ann_gap + overlap, shoe_y - cement_start_y,
+                                   facecolor='dimgray', alpha=0.70, edgecolor='none', zorder=1))
+
+        # Casing walls - no horizontal line at shoe.
+        ax.plot([x_left, x_left], [top_y, shoe_y], color='black', linewidth=1.8, zorder=6)
+        ax.plot([x_right, x_right], [top_y, shoe_y], color='black', linewidth=1.8, zorder=6)
+
+        row_geometry.append({
+            'index': i,
+            'od': float(od) if pd.notna(od) else np.nan,
+            'top_md': top_md,
+            'shoe_md': shoe_md,
+            'top_y': top_y,
+            'shoe_y': shoe_y,
+            'width': width,
+            'x_left': x_left,
+            'x_right': x_right,
+            'row': row,
+        })
+
+    # Liner hangers: choose the smallest larger casing that actually contains the liner top.
+    for geom in row_geometry:
+        row = geom['row']
+        is_liner = (geom['top_md'] > mudline_md + 100.0)
+        if not is_liner:
+            continue
+
+        child_od = geom['od']
+        top_md = geom['top_md']
+        candidates = []
+        for parent in row_geometry:
+            if parent['index'] == geom['index']:
+                continue
+            if pd.isna(parent['od']) or pd.isna(child_od) or parent['od'] <= child_od:
+                continue
+            if parent['top_md'] <= top_md <= parent['shoe_md']:
+                candidates.append(parent)
+
+        if candidates:
+            parent = min(candidates, key=lambda g: g['od'])
+            draw_tol_symbol(ax,
+                            geom['x_left'], geom['x_right'],
+                            parent['x_left'], parent['x_right'],
+                            geom['top_y'], h=0.22)
+
+        draw_shoe_symbol(ax, geom['x_left'], geom['x_right'], geom['shoe_y'], h=0.18)
+
+    # Shoe symbols for non-liners too.
+    for geom in row_geometry:
+        row = geom['row']
+        is_liner = (geom['top_md'] > mudline_md + 100.0)
+        if not is_liner:
+            draw_shoe_symbol(ax, geom['x_left'], geom['x_right'], geom['shoe_y'], h=0.18)
+
+    # -----------------------------
+    # Hole-section annotations - one row per hole size
+    # -----------------------------
+    shoes_by_id = shoes.copy()
+    if 'String_ID' in shoes_by_id.columns:
+        shoes_by_id = shoes_by_id.set_index('String_ID', drop=False)
+
+    for i, row in c.iterrows():
+        section_y = i + 0.50
+        sid = row.get('String_ID', np.nan)
+
+        if 'String_ID' in shoes_by_id.columns and sid in shoes_by_id.index:
+            srow = shoes_by_id.loc[sid]
+            if isinstance(srow, pd.DataFrame):
+                srow = srow.iloc[0]
+        else:
+            srow = row
+
+        # Pore pressure aligned with this exact hole section.
+        ppmin = srow.get('Pore_Pressure_Min_ppg', row.get('Pore_Pressure_Min_ppg', np.nan))
+        ppmax = srow.get('Pore_Pressure_Max_ppg', row.get('Pore_Pressure_Max_ppg', np.nan))
+        if pd.notna(ppmin) and pd.notna(ppmax):
+            pp_text = f'{float(ppmin):.1f}-{float(ppmax):.1f}\nppg'
+        elif pd.notna(ppmax):
+            pp_text = f'{float(ppmax):.1f}\nppg'
+        else:
+            pp_text = '-'
+        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=7.8)
+
+        # Mud aligned with the same hole size row.
+        mwmin = srow.get('Mud_Weight_Min_ppg', row.get('Mud_Weight_Min_ppg', np.nan))
+        mwmax = srow.get('Mud_Weight_Max_ppg', row.get('Mud_Weight_Max_ppg', np.nan))
+        mudtype = str(srow.get('Mud_Type', row.get('Mud_Type', '')) or '')
+        mud_lines = []
+        if pd.notna(mwmin) and pd.notna(mwmax):
+            mud_lines.append(f'MW {float(mwmin):.1f}-{float(mwmax):.1f} ppg')
+        if mudtype and mudtype.lower() != 'nan':
+            mud_lines.append(mudtype)
+        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=7.8)
+
+        # Right-side casing card aligned to this hole row.
+        hole = row.get('Hole_Size_in', np.nan)
+        od = row.get('Casing_OD_in', np.nan)
+        cid = row.get('Casing_ID_in', np.nan)
+        drift = row.get('Drift_in', np.nan)
+        grade = str(row.get('Casing_Grade', '') or '')
+
+        shoe = float(row['Shoe_MD_ft'])
+        top = float(row['Top_MD_ft'])
+        toc_md = row.get('TOC_MD_ft', np.nan)
+
+        shoe_tvd = srow.get('Shoe_TVD_ft', np.nan)
+        top_tvd = srow.get('Casing_Top_TVD_ft', np.nan)
+        toc_tvd = srow.get('TOC_TVD_ft', np.nan)
+        tempv = srow.get('Temperature_F', np.nan)
+        inc = srow.get('Inc_at_Shoe_deg', np.nan)
+        max_inc = srow.get('Max_Inc_to_Shoe_deg', np.nan)
+        fit_type = str(srow.get('FIT_LOT_Type', '') or '')
+        fit_val = srow.get('FIT_LOT_Value', np.nan)
+
+        spec_lines = []
+        if pd.notna(hole):
+            spec_lines.append(f'Hole {float(hole):g}"')
+        spec_lines.append(str(row.get('String_Name', 'String')))
+
+        size_bits = []
+        if pd.notna(od):
+            size_bits.append(f'OD {float(od):g}"')
+        if pd.notna(cid):
+            size_bits.append(f'ID {float(cid):g}"')
+        if size_bits:
+            spec_lines.append(' | '.join(size_bits))
+        if pd.notna(drift):
+            spec_lines.append(f'Drift {float(drift):g}"')
+        if grade and grade.lower() != 'nan':
+            spec_lines.append(f'Grade {grade}')
+
+        if pd.notna(shoe_tvd):
+            spec_lines.append(f'Shoe {shoe:,.0f} MD / {float(shoe_tvd):,.0f} TVD')
+        else:
+            spec_lines.append(f'Shoe {shoe:,.0f} MD')
+
+        is_liner = (top > mudline_md + 100.0)
+        prefix = 'TOL' if is_liner else 'Top'
+        if pd.notna(top_tvd):
+            spec_lines.append(f'{prefix} {top:,.0f} MD / {float(top_tvd):,.0f} TVD')
+        else:
+            spec_lines.append(f'{prefix} {top:,.0f} MD')
+
+        if pd.notna(toc_md) and pd.notna(toc_tvd):
+            spec_lines.append(f'TOC {float(toc_md):,.0f} MD / {float(toc_tvd):,.0f} TVD')
+        elif pd.notna(toc_md):
+            spec_lines.append(f'TOC {float(toc_md):,.0f} MD')
+
+        if fit_type and fit_type.lower() != 'nan' and pd.notna(fit_val):
+            spec_lines.append(f'{fit_type} {float(fit_val):.2f} ppg EMW')
+        if pd.notna(inc) and pd.notna(max_inc):
+            spec_lines.append(f'Inc {float(inc):.1f}° | Max {float(max_inc):.1f}°')
+        if pd.notna(tempv):
+            spec_lines.append(f'Temp {float(tempv):.0f}°F')
+
+        ax.text(x_info, section_y, '\n'.join(spec_lines), ha='left', va='center', fontsize=7.55,
+                bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
+
+    # -----------------------------
+    # Geological tops mapped onto the non-scale vertical sequence
+    # -----------------------------
+    if geocalc is not None and not geocalc.empty:
+        g = geocalc.dropna(subset=['MD_ft']).sort_values('MD_ft').copy()
+        actual_ys = [md_to_y(v) for v in g['MD_ft'].tolist()]
+        valid_pairs = [(i, y) for i, y in enumerate(actual_ys) if pd.notna(y)]
+        if valid_pairs:
+            min_sep = 0.28
+            placed = []
+            for _, y in valid_pairs:
+                placed.append(max(float(y), placed[-1] + min_sep if placed else 0.18))
+            overflow = placed[-1] - (section_bottom_y - 0.10)
+            if overflow > 0:
+                placed = [y - overflow for y in placed]
+            if placed[0] < 0.18:
+                shift = 0.18 - placed[0]
+                placed = [y + shift for y in placed]
+
+            for (pair_idx, y_actual), y_text in zip(valid_pairs, placed):
+                row = g.iloc[pair_idx]
+                ax.plot([-7.90, -7.75], [y_actual, y_actual], color='black', linewidth=0.75)
+                txt = f"{row['Formation_Name']}\nMD {row['MD_ft']:,.0f} | TVD {row['TVD_ft']:,.0f}"
+                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=7.15)
+
+    # TD annotation at the bottom of the schematic.
+    td_y = md_to_y(td_md)
+    if pd.isna(td_y) or td_y < section_bottom_y:
+        td_y = section_bottom_y
+    ax.text(x_well + 1.55, td_y, f'TD {td_md:,.0f} MD', va='center', fontsize=8.5, fontweight='bold')
+
+    ax.set_xlim(left_edge, right_edge)
+    ax.set_ylim(section_bottom_y + 0.55, -1.75)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_ylabel('')
+    ax.grid(False)
+    fig.tight_layout()
+    return fig
+
+
+def draw_directional_wbs(well, survey, shoes, geocalc):
+    """
+    Directional WBS side-view based on the survey trajectory.
+    X-axis = horizontal displacement from surface.
+    Y-axis = TVD.
+    """
+    fig, ax = plt.subplots(figsize=(14, 18))
+
+    s = survey.dropna(subset=['MD_ft', 'TVD_ft']).sort_values('MD_ft').reset_index(drop=True).copy()
+    if s.empty:
+        ax.text(0.5, 0.5, 'No valid directional survey data.', ha='center', va='center', transform=ax.transAxes)
+        ax.axis('off')
+        return fig
+
+    # Horizontal displacement for a clean side-view trajectory.
+    north = s['Northing_calc_ft'].to_numpy(float) if 'Northing_calc_ft' in s.columns else np.zeros(len(s))
+    east = s['Easting_calc_ft'].to_numpy(float) if 'Easting_calc_ft' in s.columns else np.zeros(len(s))
+    s['HD_ft'] = np.sqrt(north**2 + east**2)
+
+    md_arr = s['MD_ft'].to_numpy(float)
+    tvd_arr = s['TVD_ft'].to_numpy(float)
+    hd_arr = s['HD_ft'].to_numpy(float)
+
+    def interp_on_survey(md, col):
+        if pd.isna(md):
+            return np.nan
+        if md < md_arr.min() or md > md_arr.max():
+            return np.nan
+        if col == 'HD_ft':
+            return float(np.interp(md, md_arr, hd_arr))
+        if col == 'TVD_ft':
+            return float(np.interp(md, md_arr, tvd_arr))
+        if col in s.columns:
+            return float(np.interp(md, md_arr, s[col].to_numpy(float)))
+        return np.nan
+
+    def segment_between(md1, md2):
+        if pd.isna(md1) or pd.isna(md2):
+            return np.array([]), np.array([])
+        lo, hi = sorted([float(md1), float(md2)])
+        md_points = [lo]
+        internal = s[(s['MD_ft'] > lo) & (s['MD_ft'] < hi)]['MD_ft'].tolist()
+        md_points.extend(internal)
+        md_points.append(hi)
+        md_points = np.array(sorted(set(float(x) for x in md_points)))
+        x = np.interp(md_points, md_arr, hd_arr)
+        y = np.interp(md_points, md_arr, tvd_arr)
+        return x, y
+
+    # Header
+    well_name = str(well.get('Well_Name', 'Directional WBS'))
+    prospect = str(well.get('Field_Prospect', ''))
+    surf_x = well.get('Surface_X', '')
+    surf_y = well.get('Surface_Y', '')
+    bh_x = well.get('BottomHole_X', '')
+    bh_y = well.get('BottomHole_Y', '')
+
+    title = well_name if well_name and well_name != 'nan' else 'Directional WBS'
+    ax.set_title(f'{title} - Directional WBS', fontsize=16, fontweight='bold', pad=18)
+    if prospect and prospect != 'nan':
+        ax.text(0.5, 1.005, str(prospect), transform=ax.transAxes, ha='center', va='bottom', fontsize=10)
+
+    header_lines = []
+    if surf_x != '' or surf_y != '':
+        header_lines.append(f'Surface: X={surf_x}, Y={surf_y}')
+    if bh_x != '' or bh_y != '':
+        header_lines.append(f'Bottom Hole: X={bh_x}, Y={bh_y}')
+    if header_lines:
+        ax.text(0.98, 1.02, '\n'.join(header_lines), transform=ax.transAxes,
+                ha='right', va='bottom', fontsize=8.5,
+                bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
+
+    # Base trajectory
+    ax.plot(hd_arr, tvd_arr, color='0.80', linewidth=2.2, zorder=1)
+
+    # Plot casing strings as thicker trajectory segments.
+    csort = shoes.sort_values('Shoe_MD_ft').reset_index(drop=True).copy()
+    if not csort.empty:
+        line_widths = np.linspace(9.5, 3.5, len(csort))
+        colors = ['black', '0.15', '0.25', '0.35', '0.45', '0.55']
+        label_offsets = np.linspace(0, 180, len(csort))
+        for i, (_, row) in enumerate(csort.iterrows()):
+            top_md = row.get('Casing_Top_MD_ft', np.nan)
+            shoe_md = row.get('Shoe_MD_ft', np.nan)
+            x_seg, y_seg = segment_between(top_md, shoe_md)
+            if len(x_seg) >= 2:
+                ax.plot(x_seg, y_seg, color=colors[min(i, len(colors)-1)], linewidth=float(line_widths[i]),
+                        solid_capstyle='round', zorder=2)
+                # overlay a lighter inner line to make the string visible as a track
+                inner_lw = max(float(line_widths[i]) - 4.0, 1.0)
+                ax.plot(x_seg, y_seg, color='white', linewidth=inner_lw, alpha=0.55,
+                        solid_capstyle='round', zorder=3)
+
+            shoe_x = interp_on_survey(shoe_md, 'HD_ft')
+            shoe_y = interp_on_survey(shoe_md, 'TVD_ft')
+            top_tvd = row.get('Casing_Top_TVD_ft', np.nan)
+            shoe_tvd = row.get('Shoe_TVD_ft', np.nan)
+            if pd.notna(shoe_x) and pd.notna(shoe_y):
+                ax.scatter([shoe_x], [shoe_y], marker='v', s=90, color='#c8b273', edgecolor='black', zorder=5)
+                info = [str(row.get('String_Name', 'String'))]
+                if pd.notna(shoe_md) and pd.notna(shoe_tvd):
+                    info.append(f'Shoe {shoe_md:,.0f} MD / {shoe_tvd:,.0f} TVD')
+                elif pd.notna(shoe_md):
+                    info.append(f'Shoe {shoe_md:,.0f} MD')
+                prefix = 'TOL' if 'liner' in str(row.get('String_Name','')).lower() else 'Top'
+                if pd.notna(top_md) and pd.notna(top_tvd):
+                    info.append(f'{prefix} {top_md:,.0f} MD / {top_tvd:,.0f} TVD')
+                inc = row.get('Inc_at_Shoe_deg', np.nan)
+                if pd.notna(inc):
+                    info.append(f'Inc {inc:.1f}°')
+                dx = 60 if shoe_x <= np.nanmax(hd_arr) * 0.65 else -220
+                ha = 'left' if dx > 0 else 'right'
+                dy = float(label_offsets[i])
+                ax.annotate('\n'.join(info), xy=(shoe_x, shoe_y), xytext=(shoe_x + dx, shoe_y + dy),
+                            textcoords='data', ha=ha, va='center', fontsize=7.6,
+                            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='0.6'),
+                            arrowprops=dict(arrowstyle='-', color='0.5', linewidth=0.8), zorder=6)
+
+    # Geological tops along trajectory.
+    if geocalc is not None and not geocalc.empty:
+        g = geocalc.dropna(subset=['MD_ft', 'TVD_ft']).sort_values('MD_ft').copy()
+        for _, row in g.iterrows():
+            md = float(row['MD_ft'])
+            gx = interp_on_survey(md, 'HD_ft')
+            gy = float(row['TVD_ft'])
+            if pd.notna(gx) and pd.notna(gy):
+                ax.plot([gx - 28, gx + 28], [gy, gy], color='tab:red', linewidth=1.0, zorder=4)
+                ax.text(gx + 35, gy, f"{row['Formation_Name']}\nMD {md:,.0f}", fontsize=7.0,
+                        va='center', ha='left', color='black', zorder=4)
+
+    # Surface / TD markers
+    ax.scatter([hd_arr[0]], [tvd_arr[0]], color='tab:blue', s=40, zorder=6)
+    ax.text(hd_arr[0], tvd_arr[0], ' Surface', fontsize=8, va='bottom', ha='left')
+    ax.scatter([hd_arr[-1]], [tvd_arr[-1]], color='tab:green', s=40, zorder=6)
+    ax.text(hd_arr[-1], tvd_arr[-1], ' TD', fontsize=8, va='bottom', ha='left')
+
+    max_inc = float(s['Inclination_deg'].max()) if 'Inclination_deg' in s.columns and not s.empty else np.nan
+    final_hd = float(hd_arr[-1]) if len(hd_arr) else np.nan
+    summary = []
+    if pd.notna(max_inc):
+        summary.append(f'Max inclination: {max_inc:.1f}°')
+    if pd.notna(final_hd):
+        summary.append(f'Final horizontal displacement: {final_hd:,.0f} ft')
+    if summary:
+        ax.text(0.02, 0.02, '\n'.join(summary), transform=ax.transAxes, ha='left', va='bottom', fontsize=8.5,
+                bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
+
+    xmin, xmax = float(np.nanmin(hd_arr)), float(np.nanmax(hd_arr))
+    xspan = max(xmax - xmin, 1.0)
+    ax.set_xlim(xmin - 0.12 * xspan - 50, xmax + 0.25 * xspan + 150)
+    ax.set_ylim(float(np.nanmax(tvd_arr)) * 1.03, max(0.0, float(np.nanmin(tvd_arr)) - 250))
+    ax.set_xlabel('Horizontal displacement (ft)')
+    ax.set_ylabel('True Vertical Depth (ft)')
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+
+def draw_3d_directional_wbs(
+    well,
+    survey,
+    shoes,
+    geocalc,
+    show_trajectory=True,
+    show_casing=True,
+    show_shoes=True,
+    show_shoe_labels=True,
+    show_geology=True,
+    show_surface_td=True,
+    show_coordinate_box=True,
+    view_elev=24,
+    view_azim=-58,
+):
+    """3D directional WBS using Easting, Northing and TVD with layer toggles."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    fig = plt.figure(figsize=(14, 16))
+    ax = fig.add_subplot(111, projection='3d')
+
+    s = survey.dropna(subset=['MD_ft', 'TVD_ft']).sort_values('MD_ft').reset_index(drop=True).copy()
+    if s.empty:
+        ax.text2D(0.5, 0.5, 'No valid directional survey data.', transform=ax.transAxes,
+                  ha='center', va='center')
+        return fig
+
+    md_arr = s['MD_ft'].to_numpy(float)
+    tvd_arr = s['TVD_ft'].to_numpy(float)
+    north_arr = s['Northing_calc_ft'].to_numpy(float) if 'Northing_calc_ft' in s.columns else np.zeros(len(s))
+    east_arr = s['Easting_calc_ft'].to_numpy(float) if 'Easting_calc_ft' in s.columns else np.zeros(len(s))
+
+    def interp_at_md(md, arr):
+        if pd.isna(md):
+            return np.nan
+        md = float(md)
+        if md < md_arr.min() or md > md_arr.max():
+            return np.nan
+        return float(np.interp(md, md_arr, arr))
+
+    def segment_between(md1, md2):
+        if pd.isna(md1) or pd.isna(md2):
+            return np.array([]), np.array([]), np.array([])
+        lo, hi = sorted([float(md1), float(md2)])
+        md_points = [lo]
+        md_points += s[(s['MD_ft'] > lo) & (s['MD_ft'] < hi)]['MD_ft'].tolist()
+        md_points += [hi]
+        md_points = np.array(sorted(set(float(x) for x in md_points)))
+        ex = np.interp(md_points, md_arr, east_arr)
+        ny = np.interp(md_points, md_arr, north_arr)
+        tz = np.interp(md_points, md_arr, tvd_arr)
+        return ex, ny, tz
+
+    # Main survey trajectory
+    if show_trajectory:
+        ax.plot(east_arr, north_arr, tvd_arr, linewidth=2.0, alpha=0.55)
+
+    # Casing strings and shoe information
+    csort = shoes.sort_values('Shoe_MD_ft').reset_index(drop=True).copy()
+    if not csort.empty:
+        widths = np.linspace(8.0, 3.0, len(csort))
+        for i, (_, row) in enumerate(csort.iterrows()):
+            top_md = row.get('Casing_Top_MD_ft', np.nan)
+            shoe_md = row.get('Shoe_MD_ft', np.nan)
+
+            if show_casing:
+                ex, ny, tz = segment_between(top_md, shoe_md)
+                if len(ex) >= 2:
+                    ax.plot(ex, ny, tz, linewidth=float(widths[i]), alpha=0.75)
+
+            sx = interp_at_md(shoe_md, east_arr)
+            sy = interp_at_md(shoe_md, north_arr)
+            sz = interp_at_md(shoe_md, tvd_arr)
+            if pd.notna(sx) and pd.notna(sy) and pd.notna(sz):
+                if show_shoes:
+                    ax.scatter([sx], [sy], [sz], s=70, marker='v', edgecolor='black', zorder=8)
+
+                if show_shoe_labels:
+                    shoe_tvd = row.get('Shoe_TVD_ft', np.nan)
+                    inc = row.get('Inc_at_Shoe_deg', np.nan)
+                    label = str(row.get('String_Name', 'String'))
+                    if pd.notna(shoe_md) and pd.notna(shoe_tvd):
+                        label += f'\nShoe {shoe_md:,.0f} MD / {shoe_tvd:,.0f} TVD'
+                    elif pd.notna(shoe_md):
+                        label += f'\nShoe {shoe_md:,.0f} MD'
+                    if pd.notna(inc):
+                        label += f'\nInc {inc:.1f}°'
+                    ax.text(sx, sy, sz, '  ' + label, fontsize=7)
+
+    # Geological tops
+    if show_geology and geocalc is not None and not geocalc.empty:
+        g = geocalc.dropna(subset=['MD_ft', 'TVD_ft']).sort_values('MD_ft')
+        for _, row in g.iterrows():
+            md = float(row['MD_ft'])
+            gx = interp_at_md(md, east_arr)
+            gy = interp_at_md(md, north_arr)
+            gz = interp_at_md(md, tvd_arr)
+            if pd.notna(gx) and pd.notna(gy) and pd.notna(gz):
+                ax.scatter([gx], [gy], [gz], s=35, marker='s')
+                ax.text(gx, gy, gz, f"  {row['Formation_Name']}\n  MD {md:,.0f}", fontsize=7)
+
+    # Surface and TD markers
+    if show_surface_td:
+        ax.scatter([east_arr[0]], [north_arr[0]], [tvd_arr[0]], s=50, marker='o')
+        ax.text(east_arr[0], north_arr[0], tvd_arr[0], '  Surface', fontsize=8)
+        ax.scatter([east_arr[-1]], [north_arr[-1]], [tvd_arr[-1]], s=50, marker='o')
+        ax.text(east_arr[-1], north_arr[-1], tvd_arr[-1], '  TD', fontsize=8)
+
+    well_name = str(well.get('Well_Name', 'Deepwater Well'))
+    ax.set_title(f'{well_name} - 3D Directional WBS', fontsize=15, fontweight='bold', pad=20)
+
+    ax.set_xlabel('Easting (ft)', labelpad=10)
+    ax.set_ylabel('Northing (ft)', labelpad=10)
+    ax.set_zlabel('TVD (ft)', labelpad=10)
+    ax.invert_zaxis()
+    ax.view_init(elev=float(view_elev), azim=float(view_azim))
+
+    # Header coordinate information
+    if show_coordinate_box:
+        surf_x = well.get('Surface_X', '')
+        surf_y = well.get('Surface_Y', '')
+        bh_x = well.get('BottomHole_X', '')
+        bh_y = well.get('BottomHole_Y', '')
+        header_lines = []
+        if surf_x != '' or surf_y != '':
+            header_lines.append(f'Surface X={surf_x}, Y={surf_y}')
+        if bh_x != '' or bh_y != '':
+            header_lines.append(f'Bottom Hole X={bh_x}, Y={bh_y}')
+        if header_lines:
+            ax.text2D(0.98, 0.98, '\n'.join(header_lines), transform=ax.transAxes,
+                      ha='right', va='top', fontsize=8.5,
+                      bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
+
+    fig.tight_layout()
+    return fig
+
+
+
+
+def extract_ddr_text(uploaded_file):
+    """Extract text from an uploaded DDR PDF using pypdf."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ImportError(
+            "The pypdf package is not installed. Add 'pypdf' to requirements.txt."
+        ) from exc
+
+    uploaded_file.seek(0)
+    reader = PdfReader(uploaded_file)
+    pages = []
+
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+
+    return "\n\n".join(pages)
+
+
+# -----------------------------
+# Gemini Daily Report Agent
+# -----------------------------
+DDR_STRUCTURED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "report_date": {
+            "type": "string",
+            "description": "DDR report date exactly as stated in the report, if available."
+        },
+        "current_md_ft": {
+            "type": "number",
+            "description": "Latest/current measured depth in feet."
+        },
+        "current_tvd_ft": {
+            "type": "number",
+            "description": "Latest/current true vertical depth in feet, only if explicitly stated."
+        },
+        "hole_section": {
+            "type": "string",
+            "description": "Current hole section, for example 12-1/4 in or 8-1/2 in."
+        },
+        "current_operation": {
+            "type": "string",
+            "description": "Current operation at the end of the reporting period."
+        },
+        "next_operation": {
+            "type": "string",
+            "description": "Next planned operation explicitly stated in the DDR."
+        },
+        "mud_weight_ppg": {
+            "type": "number",
+            "description": "Current mud weight in ppg."
+        },
+        "mud_type": {
+            "type": "string",
+            "description": "Current drilling fluid type, such as SBM or WBM."
+        },
+        "losses_bbl_hr": {
+            "type": "number",
+            "description": "Current loss rate in bbl/hr, if explicitly stated."
+        },
+        "losses_24h_bbl": {
+            "type": "number",
+            "description": "Total losses during the reporting period in barrels, if explicitly stated."
+        },
+        "npt_hours_24h": {
+            "type": "number",
+            "description": "NPT hours during the reporting period."
+        },
+        "npt_category": {
+            "type": "string",
+            "description": "Primary NPT category or cause."
+        },
+        "casing_status": {
+            "type": "string",
+            "description": "Latest casing or liner status explicitly stated in the DDR."
+        },
+        "fit_lot_ppg": {
+            "type": "number",
+            "description": "Latest FIT or LOT result in ppg EMW, if explicitly stated."
+        },
+        "fit_lot_type": {
+            "type": "string",
+            "description": "FIT or LOT, if explicitly stated."
+        },
+        "key_events": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Important operational events from the reporting period."
+        }
+    }
+}
+
+
+def _streamlit_secret(name, default=None):
+    """Safely read a Streamlit secret without breaking local runs."""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def get_gemini_client():
+    """Create a Gemini client from Streamlit Secrets or environment variables."""
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise ImportError(
+            "The google-genai package is not installed. Add 'google-genai' to requirements.txt."
+        ) from exc
+
+    api_key = _streamlit_secret("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key not found. Add GEMINI_API_KEY to Streamlit Secrets."
+        )
+
+    return genai.Client(api_key=api_key)
+
+
+def extract_ddr_structured_with_gemini(ddr_text):
+    """
+    Extract a structured daily-well state from DDR text using Gemini Structured Output.
+    Missing information is left absent by Gemini and normalized to None locally.
+    """
+    if not ddr_text or not ddr_text.strip():
+        raise ValueError("DDR text is empty; Gemini extraction cannot run.")
+
+    try:
+        from google.genai import types
+    except ImportError as exc:
+        raise ImportError(
+            "The google-genai package is not installed. Add 'google-genai' to requirements.txt."
+        ) from exc
+
+    client = get_gemini_client()
+    model_name = (
+        _streamlit_secret("GEMINI_MODEL")
+        or os.getenv("GEMINI_MODEL")
+        or "gemini-2.5-flash"
+    )
+
+    # Keep a generous cap to avoid accidentally sending a very large converted PDF.
+    max_chars = 120000
+    report_text = ddr_text[:max_chars]
+
+    prompt = f"""
+You are the Daily Report Agent for a deepwater drilling well.
+Extract operational facts from the Daily Drilling Report below into the requested JSON schema.
+
+Rules:
+- Use ONLY information explicitly supported by the DDR text.
+- Do not guess, calculate, or infer missing engineering values.
+- Use the latest/current value when multiple depths or mud weights appear.
+- Current operation means the operation at the end of the reporting period.
+- Next operation must come from an explicit forward plan / next operation statement.
+- Keep casing_status concise but preserve the casing/liner size when stated.
+- FIT/LOT values must be reported only when the report clearly identifies them.
+- NPT hours must reflect the reporting period, not cumulative historical NPT, unless that is the only value explicitly stated.
+- key_events should contain concise operationally important events only.
+- If a field is not supported by the DDR, omit that field rather than inventing a value.
+
+DAILY DRILLING REPORT TEXT:
+----------------------------
+{report_text}
+----------------------------
+"""
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=DDR_STRUCTURED_SCHEMA,
+            temperature=0.1,
+        ),
+    )
+
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty response.")
+
+    data = json.loads(response.text)
+
+    # Normalize the result so the UI always has predictable keys.
+    defaults = {
+        "report_date": None,
+        "current_md_ft": None,
+        "current_tvd_ft": None,
+        "hole_section": None,
+        "current_operation": None,
+        "next_operation": None,
+        "mud_weight_ppg": None,
+        "mud_type": None,
+        "losses_bbl_hr": None,
+        "losses_24h_bbl": None,
+        "npt_hours_24h": None,
+        "npt_category": None,
+        "casing_status": None,
+        "fit_lot_ppg": None,
+        "fit_lot_type": None,
+        "key_events": [],
+    }
+    result = defaults.copy()
+    if isinstance(data, dict):
+        result.update(data)
+    if not isinstance(result.get("key_events"), list):
+        result["key_events"] = []
+    return result
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Deepwater Wellbore Schematic Builder")
+st.caption("Prototype: casing + survey + geological tops + FIT/LOT + temperature integration")
+
+uploaded = st.file_uploader("Upload the Deepwater WBS Excel template", type=["xlsx"])
+
+if not uploaded:
+    st.info("Use the provided input template, populate your well data, then upload it here.")
+    st.stop()
+
+try:
+    well, casing, survey_raw, geo, temp, fitlot = read_workbook(uploaded)
+    survey = minimum_curvature_tvd(survey_raw.dropna(subset=["MD_ft","Inclination_deg","Azimuth_deg"]))
+    rkb = float(well.get("RKB", 0) or 0)
+    if not well.get("Mudline_TVD_RKB") or pd.isna(well.get("Mudline_TVD_RKB")):
+        well["Mudline_TVD_RKB"] = float(well.get("Water_Depth",0) or 0) + rkb
+
+    shoes = calculate_shoe_data(casing, survey, temp, well, fitlot)
+    geocalc = calculate_geo_data(geo, survey, temp, rkb)
+
+except Exception as e:
+    st.error(f"Could not process workbook: {e}")
+    st.stop()
+
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    [
+        "Daily Operations",
+        "Well / Casing",
+        "Directional Survey",
+        "Geological Tops",
+        "MD ↔ TVD Calculator",
+        "Wellbore Schematic",
+        "Directional WBS",
+        "3D Directional WBS",
+    ]
+)
+
+with tab0:
+    st.subheader("Daily Operations")
+
+    st.write(
+        "Upload the latest Daily Drilling Report and latest directional survey."
+    )
+
+    latest_ddr = st.file_uploader(
+        "Upload Latest DDR",
+        type=["pdf", "docx", "xlsx", "xls"],
+        key="daily_ops_latest_ddr"
+    )
+
+    latest_directional_survey = st.file_uploader(
+        "Upload Latest Directional Survey",
+        type=["xlsx", "xls", "csv"],
+        key="daily_ops_latest_directional_survey"
+    )
+
+    if latest_ddr is not None:
+        st.success(f"DDR uploaded: {latest_ddr.name}")
+
+    if latest_directional_survey is not None:
+        st.success(
+            f"Directional survey uploaded: {latest_directional_survey.name}"
+        )
+
+    run_daily_update = st.button(
+        "Run Daily Update",
+        type="primary",
+        key="daily_ops_run_daily_update"
+    )
+
+    if run_daily_update:
+        if latest_ddr is None and latest_directional_survey is None:
+            st.warning(
+                "Please upload both the Latest DDR and Latest Directional Survey."
+            )
+
+        elif latest_ddr is None:
+            st.warning(
+                "Please upload the Latest DDR before running the daily update."
+            )
+
+        elif latest_directional_survey is None:
+            st.warning(
+                "Please upload the Latest Directional Survey before running the daily update."
+            )
+
+        else:
+            st.success("Both files are ready for processing.")
+
+            # -----------------------------------
+            # Read Daily Drilling Report PDF
+            # -----------------------------------
+            if latest_ddr.name.lower().endswith(".pdf"):
+                try:
+                    ddr_text = extract_ddr_text(latest_ddr)
+                    st.session_state["latest_ddr_text"] = ddr_text
+
+                    if ddr_text.strip():
+                        st.success("Daily Drilling Report text extracted successfully.")
+
+                        # Run the Gemini Daily Report Agent after PDF text extraction.
+                        try:
+                            with st.spinner("Gemini Daily Report Agent is extracting DDR fields..."):
+                                daily_report_result = extract_ddr_structured_with_gemini(ddr_text)
+                            st.session_state["daily_report_agent_result"] = daily_report_result
+                            st.success("Daily Report Agent structured extraction completed.")
+                        except Exception as agent_error:
+                            st.error(f"Daily Report Agent could not run: {agent_error}")
+                    else:
+                        st.warning(
+                            "The DDR PDF was opened, but no selectable text was found. "
+                            "This may be a scanned/image-only PDF."
+                        )
+
+                except Exception as e:
+                    st.error(f"Could not read the DDR PDF: {e}")
+            else:
+                st.info(
+                    "DDR text extraction currently supports PDF files. "
+                    "PDF is recommended for the first Daily Report Agent version."
+                )
+
+            if "latest_ddr_text" in st.session_state:
+                st.subheader("DDR Text Preview")
+                ddr_preview = st.session_state["latest_ddr_text"]
+
+                st.text_area(
+                    "Extracted DDR text",
+                    ddr_preview[:10000],
+                    height=350,
+                    key="daily_ops_ddr_preview",
+                )
+
+            try:
+                # -----------------------------------
+                # Read latest actual directional survey
+                # -----------------------------------
+                if latest_directional_survey.name.lower().endswith(".csv"):
+                    daily_survey_df = pd.read_csv(latest_directional_survey)
+                else:
+                    daily_survey_df = pd.read_excel(latest_directional_survey)
+
+                # Clean column names before mapping.
+                daily_survey_df.columns = [
+                    str(col).strip() for col in daily_survey_df.columns
+                ]
+
+                st.subheader("Latest Directional Survey Preview")
+                st.dataframe(daily_survey_df, use_container_width=True)
+
+                # -----------------------------------
+                # Map common survey headings to the
+                # standard names used by the WBS app.
+                # -----------------------------------
+                column_aliases = {
+                    "MD": "MD_ft",
+                    "MD (FT)": "MD_ft",
+                    "MD_FT": "MD_ft",
+                    "INC": "Inclination_deg",
+                    "INCL": "Inclination_deg",
+                    "INCLINATION": "Inclination_deg",
+                    "AZI": "Azimuth_deg",
+                    "AZIMUTH": "Azimuth_deg",
+                    "TVD": "TVD_ft",
+                    "TVD (FT)": "TVD_ft",
+                    "DLS": "DLS_calc_deg_per_100ft",
+                    "DLS (DEG/100FT)": "DLS_calc_deg_per_100ft",
+                    "NORTHINGS": "Northing_calc_ft",
+                    "NORTHING": "Northing_calc_ft",
+                    "EASTINGS": "Easting_calc_ft",
+                    "EASTING": "Easting_calc_ft",
+                }
+
+                rename_map = {}
+                for col in daily_survey_df.columns:
+                    normalized = str(col).strip().upper()
+                    if normalized in column_aliases:
+                        rename_map[col] = column_aliases[normalized]
+
+                daily_survey_mapped = daily_survey_df.rename(
+                    columns=rename_map
+                ).copy()
+
+                # If the uploaded survey already uses the WBS names,
+                # this leaves them unchanged.
+                required_columns = [
+                    "MD_ft",
+                    "Inclination_deg",
+                    "Azimuth_deg",
+                ]
+
+                missing_columns = [
+                    col for col in required_columns
+                    if col not in daily_survey_mapped.columns
+                ]
+
+                if missing_columns:
+                    st.error(
+                        "The directional survey is missing required columns: "
+                        + ", ".join(missing_columns)
+                    )
+                    st.info(
+                        "The app can recognize common names such as "
+                        "MD, INC, AZI, TVD, DLS, Northings and Eastings."
+                    )
+
+                else:
+                    # Convert the key columns to numeric and remove invalid rows.
+                    numeric_columns = [
+                        "MD_ft",
+                        "Inclination_deg",
+                        "Azimuth_deg",
+                        "TVD_ft",
+                        "DLS_calc_deg_per_100ft",
+                        "Northing_calc_ft",
+                        "Easting_calc_ft",
+                    ]
+
+                    for col in numeric_columns:
+                        if col in daily_survey_mapped.columns:
+                            daily_survey_mapped[col] = pd.to_numeric(
+                                daily_survey_mapped[col],
+                                errors="coerce"
+                            )
+
+                    daily_survey_mapped = (
+                        daily_survey_mapped
+                        .dropna(subset=required_columns)
+                        .sort_values("MD_ft")
+                        .reset_index(drop=True)
+                    )
+
+                    if daily_survey_mapped.empty:
+                        st.error(
+                            "No valid directional survey stations were found after cleaning the file."
+                        )
+
+                    else:
+                        # If TVD or DLS are not supplied, calculate them using
+                        # the existing minimum-curvature engine.
+                        needs_calculation = (
+                            "TVD_ft" not in daily_survey_mapped.columns
+                            or daily_survey_mapped["TVD_ft"].isna().any()
+                            or "DLS_calc_deg_per_100ft" not in daily_survey_mapped.columns
+                            or daily_survey_mapped["DLS_calc_deg_per_100ft"].isna().any()
+                        )
+
+                        if needs_calculation:
+                            calc_input = daily_survey_mapped.copy()
+                            if "TVD_ft" in calc_input.columns:
+                                calc_input["TVD_ft_optional"] = calc_input["TVD_ft"]
+                            daily_survey_mapped = minimum_curvature_tvd(calc_input)
+
+                        latest_station = daily_survey_mapped.iloc[-1]
+
+                        # Keep the processed actual survey available during this session.
+                        st.session_state["latest_actual_survey"] = daily_survey_mapped
+
+                        st.subheader("Latest Actual Survey Station")
+
+                        m1, m2, m3, m4 = st.columns(4)
+
+                        with m1:
+                            st.metric(
+                                "MD",
+                                f"{latest_station['MD_ft']:,.1f} ft"
+                            )
+
+                        with m2:
+                            if "TVD_ft" in latest_station.index and pd.notna(latest_station["TVD_ft"]):
+                                st.metric(
+                                    "TVD",
+                                    f"{latest_station['TVD_ft']:,.1f} ft"
+                                )
+                            else:
+                                st.metric("TVD", "N/A")
+
+                        with m3:
+                            st.metric(
+                                "Inclination",
+                                f"{latest_station['Inclination_deg']:.2f}°"
+                            )
+
+                        with m4:
+                            if (
+                                "DLS_calc_deg_per_100ft" in latest_station.index
+                                and pd.notna(latest_station["DLS_calc_deg_per_100ft"])
+                            ):
+                                st.metric(
+                                    "DLS",
+                                    f"{latest_station['DLS_calc_deg_per_100ft']:.2f}°/100 ft"
+                                )
+                            else:
+                                st.metric("DLS", "N/A")
+
+                        # -----------------------------------
+                        # Compare latest Actual vs Planned
+                        # -----------------------------------
+                        actual_md = float(latest_station["MD_ft"])
+
+                        planned_inc = interp_by_md(
+                            survey, actual_md, "Inclination_deg"
+                        )
+                        planned_azi = interp_by_md(
+                            survey, actual_md, "Azimuth_deg"
+                        )
+
+                        actual_inc = float(
+                            latest_station["Inclination_deg"]
+                        )
+                        actual_azi = float(
+                            latest_station["Azimuth_deg"]
+                        )
+
+                        if (
+                            "DLS_calc_deg_per_100ft" in latest_station.index
+                            and pd.notna(latest_station["DLS_calc_deg_per_100ft"])
+                        ):
+                            actual_dls = float(
+                                latest_station["DLS_calc_deg_per_100ft"]
+                            )
+                        else:
+                            actual_dls = np.nan
+
+                        if pd.isna(planned_inc) or pd.isna(planned_azi):
+                            st.warning(
+                                "The latest actual MD is outside the planned survey range, "
+                                "so Plan vs Actual comparison cannot be calculated at this depth."
+                            )
+
+                        else:
+                            inc_variance = actual_inc - planned_inc
+
+                            # Use shortest angular difference for azimuth.
+                            azi_variance = (
+                                (actual_azi - planned_azi + 180.0) % 360.0
+                            ) - 180.0
+
+                            st.subheader("Directional Plan vs Actual")
+
+                            p1, p2, p3 = st.columns(3)
+
+                            with p1:
+                                st.metric(
+                                    "Inclination",
+                                    f"{actual_inc:.2f}°",
+                                    delta=f"{inc_variance:+.2f}° vs plan"
+                                )
+                                st.caption(
+                                    f"Planned: {planned_inc:.2f}°"
+                                )
+
+                            with p2:
+                                st.metric(
+                                    "Azimuth",
+                                    f"{actual_azi:.2f}°",
+                                    delta=f"{azi_variance:+.2f}° vs plan"
+                                )
+                                st.caption(
+                                    f"Planned: {planned_azi:.2f}°"
+                                )
+
+                            with p3:
+                                if pd.notna(actual_dls):
+                                    st.metric(
+                                        "DLS",
+                                        f"{actual_dls:.2f}°/100 ft"
+                                    )
+                                else:
+                                    st.metric("DLS", "N/A")
+
+                            # Directional warning limits
+                            INC_WARNING = 2.0
+                            AZI_WARNING = 5.0
+                            DLS_WARNING = 3.0
+
+                            st.subheader("Directional Status")
+
+                            warnings = []
+
+                            if abs(inc_variance) > INC_WARNING:
+                                warnings.append(
+                                    f"Inclination is {inc_variance:+.2f}° from plan."
+                                )
+
+                            if abs(azi_variance) > AZI_WARNING:
+                                warnings.append(
+                                    f"Azimuth is {azi_variance:+.2f}° from plan."
+                                )
+
+                            if pd.notna(actual_dls) and actual_dls > DLS_WARNING:
+                                warnings.append(
+                                    f"DLS is {actual_dls:.2f}°/100 ft, "
+                                    f"above the {DLS_WARNING:.1f}°/100 ft warning limit."
+                                )
+
+                            if warnings:
+                                for message in warnings:
+                                    st.warning(message)
+                            else:
+                                st.success(
+                                    "Directional survey is within the current warning limits."
+                                )
+
+            except Exception as e:
+                st.error(
+                    f"Could not process the directional survey: {e}"
+                )
+
+
+    # -----------------------------------
+    # Daily Report Agent Review Panel
+    # -----------------------------------
+    if "daily_report_agent_result" in st.session_state:
+        result = st.session_state["daily_report_agent_result"]
+
+        st.divider()
+        st.subheader("Daily Report Agent Review")
+        st.caption(
+            "Review the Gemini-extracted DDR values before they are allowed to update the WBS. "
+            "This version does not automatically overwrite planned engineering data."
+        )
+
+        def _fmt_number(value, suffix="", decimals=1):
+            if value is None or pd.isna(value):
+                return "N/A"
+            try:
+                return f"{float(value):,.{decimals}f}{suffix}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            st.metric("Current MD", _fmt_number(result.get("current_md_ft"), " ft", 1))
+        with r2:
+            st.metric("Current TVD", _fmt_number(result.get("current_tvd_ft"), " ft", 1))
+        with r3:
+            st.metric("Mud Weight", _fmt_number(result.get("mud_weight_ppg"), " ppg", 2))
+        with r4:
+            st.metric("NPT (24 hr)", _fmt_number(result.get("npt_hours_24h"), " hr", 2))
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Report / Well Status**")
+            st.write(f"Report date: **{result.get('report_date') or 'N/A'}**")
+            st.write(f"Hole section: **{result.get('hole_section') or 'N/A'}**")
+            st.write(f"Mud type: **{result.get('mud_type') or 'N/A'}**")
+            st.write(f"Casing status: **{result.get('casing_status') or 'N/A'}**")
+            fit_type = result.get("fit_lot_type") or "FIT/LOT"
+            fit_value = _fmt_number(result.get("fit_lot_ppg"), " ppg EMW", 2)
+            st.write(f"{fit_type}: **{fit_value}**")
+
+        with right:
+            st.markdown("**Operations / Events**")
+            st.write(f"Current operation: **{result.get('current_operation') or 'N/A'}**")
+            st.write(f"Next operation: **{result.get('next_operation') or 'N/A'}**")
+            st.write(f"Loss rate: **{_fmt_number(result.get('losses_bbl_hr'), ' bbl/hr', 2)}**")
+            st.write(f"24 hr losses: **{_fmt_number(result.get('losses_24h_bbl'), ' bbl', 1)}**")
+            st.write(f"NPT category: **{result.get('npt_category') or 'N/A'}**")
+
+        st.markdown("**Key Events**")
+        events = result.get("key_events") or []
+        if events:
+            for event in events:
+                st.write(f"- {event}")
+        else:
+            st.write("No key events were extracted.")
+
+        with st.expander("View structured Gemini JSON"):
+            st.json(result)
+
+with tab1:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Well information")
+        st.json({k: (None if pd.isna(v) else v) for k,v in well.items()})
+    with c2:
+        st.subheader("Calculated hole-section / casing data")
+        st.dataframe(shoes, use_container_width=True)
+
+with tab2:
+    st.subheader("Survey used by the calculation engine")
+    st.dataframe(survey, use_container_width=True)
+    chart_df = survey[["MD_ft","TVD_ft","Inclination_deg"]].set_index("MD_ft")
+    st.line_chart(chart_df[["TVD_ft","Inclination_deg"]])
+
+with tab3:
+    st.subheader("Calculated geological tops")
+    st.dataframe(geocalc, use_container_width=True)
+
+with tab4:
+    mode = st.radio("Input depth type", ["MD", "TVD"], horizontal=True)
+    depth = st.number_input("Depth (ft)", min_value=0.0, value=15000.0, step=10.0)
+    if mode == "MD":
+        tvd = interp_by_md(survey, depth, "TVD_ft")
+        inc = interp_by_md(survey, depth, "Inclination_deg")
+        azi = interp_by_md(survey, depth, "Azimuth_deg")
+        tempv = temp_at_tvd(temp, tvd) if pd.notna(tvd) else np.nan
+        st.metric("TVD", f"{tvd:,.1f} ft" if pd.notna(tvd) else "Outside survey")
+        st.write(f"Inclination: **{inc:.2f}°**" if pd.notna(inc) else "Inclination unavailable")
+        st.write(f"Azimuth: **{azi:.2f}°**" if pd.notna(azi) else "Azimuth unavailable")
+        st.write(f"Temperature: **{tempv:.1f} °F**" if pd.notna(tempv) else "Temperature unavailable")
+    else:
+        sols = md_solutions_from_tvd(survey, depth)
+        if not sols:
+            st.warning("No MD solution within the survey range.")
+        elif len(sols) == 1:
+            st.metric("MD", f"{sols[0]:,.1f} ft")
+        else:
+            st.warning("This TVD occurs at more than one MD. Select the applicable well section.")
+            st.write([round(x,1) for x in sols])
+
+with tab5:
+    fig = draw_wbs(well, casing, shoes, geocalc, fitlot)
+    st.pyplot(fig, use_container_width=False)
+
+    png_buf = io.BytesIO()
+    fig.savefig(png_buf, format="png", dpi=220, bbox_inches="tight")
+    png_buf.seek(0)
+
+    pdf_buf = io.BytesIO()
+    fig.savefig(pdf_buf, format="pdf", bbox_inches="tight")
+    pdf_buf.seek(0)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download WBS PNG",
+            data=png_buf.getvalue(),
+            file_name="wellbore_schematic.png",
+            mime="image/png",
+        )
+    with c2:
+        st.download_button(
+            "Download WBS PDF",
+            data=pdf_buf.getvalue(),
+            file_name="wellbore_schematic.pdf",
+            mime="application/pdf",
+        )
+
+with tab6:
+    fig_dir = draw_directional_wbs(well, survey, shoes, geocalc)
+    st.pyplot(fig_dir, use_container_width=False)
+
+    dir_png_buf = io.BytesIO()
+    fig_dir.savefig(dir_png_buf, format="png", dpi=220, bbox_inches="tight")
+    dir_png_buf.seek(0)
+
+    dir_pdf_buf = io.BytesIO()
+    fig_dir.savefig(dir_pdf_buf, format="pdf", bbox_inches="tight")
+    dir_pdf_buf.seek(0)
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Download Directional WBS PNG",
+            data=dir_png_buf.getvalue(),
+            file_name="directional_wbs.png",
+            mime="image/png",
+        )
+    with d2:
+        st.download_button(
+            "Download Directional WBS PDF",
+            data=dir_pdf_buf.getvalue(),
+            file_name="directional_wbs.pdf",
+            mime="application/pdf",
+        )
+
+with tab7:
+    st.subheader("3D display controls")
+
+    t1, t2, t3, t4 = st.columns(4)
+    with t1:
+        show_trajectory = st.toggle("Trajectory", value=True, key="3d_trajectory")
+        show_casing = st.toggle("Casing strings", value=True, key="3d_casing")
+    with t2:
+        show_shoes = st.toggle("Shoe markers", value=True, key="3d_shoes")
+        show_shoe_labels = st.toggle("Shoe labels", value=True, key="3d_shoe_labels")
+    with t3:
+        show_geology = st.toggle("Geological tops", value=True, key="3d_geology")
+        show_surface_td = st.toggle("Surface / TD", value=True, key="3d_surface_td")
+    with t4:
+        show_coordinate_box = st.toggle("Coordinate box", value=True, key="3d_coord_box")
+
+    a1, a2 = st.columns(2)
+    with a1:
+        view_elev = st.slider("3D elevation angle", min_value=5, max_value=80, value=24, step=1, key="3d_elev")
+    with a2:
+        view_azim = st.slider("3D azimuth angle", min_value=-180, max_value=180, value=-58, step=1, key="3d_azim")
+
+    fig_3d = draw_3d_directional_wbs(
+        well,
+        survey,
+        shoes,
+        geocalc,
+        show_trajectory=show_trajectory,
+        show_casing=show_casing,
+        show_shoes=show_shoes,
+        show_shoe_labels=show_shoe_labels,
+        show_geology=show_geology,
+        show_surface_td=show_surface_td,
+        show_coordinate_box=show_coordinate_box,
+        view_elev=view_elev,
+        view_azim=view_azim,
+    )
+    st.pyplot(fig_3d, use_container_width=False)
+
+    w3_png = io.BytesIO()
+    fig_3d.savefig(w3_png, format="png", dpi=220, bbox_inches="tight")
+    w3_png.seek(0)
+
+    w3_pdf = io.BytesIO()
+    fig_3d.savefig(w3_pdf, format="pdf", bbox_inches="tight")
+    w3_pdf.seek(0)
+
+    e1, e2 = st.columns(2)
+    with e1:
+        st.download_button(
+            "Download 3D WBS PNG",
+            data=w3_png.getvalue(),
+            file_name="3d_directional_wbs.png",
+            mime="image/png",
+        )
+    with e2:
+        st.download_button(
+            "Download 3D WBS PDF",
+            data=w3_pdf.getvalue(),
+            file_name="3d_directional_wbs.pdf",
+            mime="application/pdf",
+        )
+
+
+try:
+    out_excel = make_output_excel(
+        well, casing, survey, geo, temp, fitlot, shoes, geocalc
+    )
+
+    st.download_button(
+        "Download calculated workbook",
+        data=out_excel,
+        file_name="calculated_wbs_data.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+except Exception as e:
+    st.warning(
+        "The WBS was generated successfully, but the calculated Excel "
+        "workbook could not be created."
+    )
+    st.error(str(e))
+
+
