@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from pypdf import PdfReader
 
 st.set_page_config(page_title="Deepwater WBS Builder", layout="wide")
 
@@ -303,34 +302,39 @@ def make_output_excel(well, casing, survey, geo, temp, fitlot, shoes, geocalc):
 
 def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     """
-    Conventional WBS schematic.
+    Conventional WBS schematic with adaptive vertical spacing.
 
     Design goals:
-    - dedicated Well_Name from Well_Info
-    - relative depth placement for hole sections and markers
-    - separate columns for Hole, Casing, and FIT/LOT
-    - casing widths based on actual OD so nested strings remain visually correct
-    - right-side annotations aligned with the matching hole section
+    - align Pore Pressure, Mud Weight and Hole labels with the matching hole section
+    - keep casing descriptions at shoe depth
+    - increase spacing automatically where multiple casing labels share a shoe
+    - increase spacing automatically where geological tops are dense
+    - preserve relative depth order without forcing a strict physical scale
     """
     from matplotlib.patches import Rectangle, Polygon
     from pathlib import Path
 
-    fig, ax = plt.subplots(figsize=(27, 20))
+    fig, ax = plt.subplots(figsize=(27, 22))
 
     def draw_shoe_symbol(ax, x_left, x_right, y, h=0.16, color='black', wedge_color='#c8b273'):
         bw = 0.07
-        ax.add_patch(Rectangle((x_left - bw, y - h), bw, h, facecolor=color, edgecolor=color, linewidth=0, zorder=7))
-        ax.add_patch(Rectangle((x_right, y - h), bw, h, facecolor=color, edgecolor=color, linewidth=0, zorder=7))
+        ax.add_patch(Rectangle((x_left - bw, y - h), bw, h,
+                               facecolor=color, edgecolor=color, linewidth=0, zorder=7))
+        ax.add_patch(Rectangle((x_right, y - h), bw, h,
+                               facecolor=color, edgecolor=color, linewidth=0, zorder=7))
         tw = 0.11
-        ax.add_patch(Polygon([(x_left, y - h), (x_left - tw, y), (x_left, y)], closed=True,
-                             facecolor=wedge_color, edgecolor=color, linewidth=1.0, zorder=8))
-        ax.add_patch(Polygon([(x_right, y - h), (x_right + tw, y), (x_right, y)], closed=True,
-                             facecolor=wedge_color, edgecolor=color, linewidth=1.0, zorder=8))
+        ax.add_patch(Polygon([(x_left, y - h), (x_left - tw, y), (x_left, y)],
+                             closed=True, facecolor=wedge_color, edgecolor=color,
+                             linewidth=1.0, zorder=8))
+        ax.add_patch(Polygon([(x_right, y - h), (x_right + tw, y), (x_right, y)],
+                             closed=True, facecolor=wedge_color, edgecolor=color,
+                             linewidth=1.0, zorder=8))
 
     def draw_tol_symbol(ax, liner_left, liner_right, outer_left, outer_right, y, h=0.22, color='black'):
         hanger_h = h * 0.38
         hanger_top = y - hanger_h * 0.60
         overlap = 0.025
+
         ax.add_patch(Rectangle(
             (outer_left - overlap, hanger_top),
             max((liner_left + overlap) - (outer_left - overlap), 0.03),
@@ -343,15 +347,22 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             hanger_h,
             facecolor=color, edgecolor=color, linewidth=0, zorder=9
         ))
+
         step_h = hanger_h * 0.32
         step_w = min(max((liner_left - outer_left) * 0.28, 0.05), 0.15)
-        ax.add_patch(Rectangle((liner_left - step_w, hanger_top - step_h * 0.15),
-                               step_w + overlap, step_h,
-                               facecolor=color, edgecolor=color, linewidth=0, zorder=10))
-        ax.add_patch(Rectangle((liner_right - overlap, hanger_top - step_h * 0.15),
-                               step_w + overlap, step_h,
-                               facecolor=color, edgecolor=color, linewidth=0, zorder=10))
 
+        ax.add_patch(Rectangle(
+            (liner_left - step_w, hanger_top - step_h * 0.15),
+            step_w + overlap, step_h,
+            facecolor=color, edgecolor=color, linewidth=0, zorder=10
+        ))
+        ax.add_patch(Rectangle(
+            (liner_right - overlap, hanger_top - step_h * 0.15),
+            step_w + overlap, step_h,
+            facecolor=color, edgecolor=color, linewidth=0, zorder=10
+        ))
+
+    # Basic data
     rkb = float(well.get('RKB', 0) or 0)
     water_depth = float(well.get('Water_Depth', 0) or 0)
     mudline_md = float(well.get('Mudline_TVD_RKB', water_depth + rkb) or (water_depth + rkb))
@@ -367,12 +378,59 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         c['_display_order'] = pd.to_numeric(c['Display_Order'], errors='coerce')
     else:
         c['_display_order'] = np.nan
+
     c['_od_sort'] = pd.to_numeric(c.get('Casing_OD_in'), errors='coerce')
     c = c.sort_values(['_display_order', '_od_sort'], ascending=[True, False], na_position='last').reset_index(drop=True)
 
     td_md = float(well.get('Planned_TD_MD', c['Shoe_MD_ft'].astype(float).max()) or c['Shoe_MD_ft'].astype(float).max())
-    depth_span = max(td_md - mudline_md, 1.0)
-    section_bottom_y = 13.2
+
+    # Adaptive vertical depth map
+    shoe_depths = sorted(set(float(v) for v in c['Shoe_MD_ft'].dropna().tolist()))
+    anchor_depths = [mudline_md]
+    anchor_depths += [d for d in shoe_depths if mudline_md < d < td_md]
+    if td_md not in anchor_depths:
+        anchor_depths.append(td_md)
+    anchor_depths = sorted(set(anchor_depths))
+
+    geo_depths = []
+    if geocalc is not None and not geocalc.empty and 'MD_ft' in geocalc.columns:
+        geo_depths = [float(v) for v in geocalc['MD_ft'].dropna().tolist()
+                      if mudline_md <= float(v) <= td_md]
+
+    shoe_count = {}
+    for d in c['Shoe_MD_ft'].dropna().astype(float):
+        shoe_count[round(float(d), 3)] = shoe_count.get(round(float(d), 3), 0) + 1
+
+    raw_interval_heights = []
+    total_md_span = max(td_md - mudline_md, 1.0)
+
+    for i in range(len(anchor_depths) - 1):
+        a = anchor_depths[i]
+        b = anchor_depths[i + 1]
+        md_fraction = max((b - a) / total_md_span, 0.0)
+
+        base = max(0.65, md_fraction * 10.0)
+        end_shoe_count = shoe_count.get(round(float(b), 3), 0)
+        casing_bonus = max(0, end_shoe_count - 1) * 1.35
+
+        tops_in_interval = sum(1 for d in geo_depths if a < d <= b)
+        geo_bonus = tops_in_interval * 0.34
+
+        lower_bonus = 0.0
+        if b >= td_md * 0.85 or a >= td_md * 0.75:
+            lower_bonus = 0.55 + tops_in_interval * 0.16
+
+        raw_interval_heights.append(base + casing_bonus + geo_bonus + lower_bonus)
+
+    target_display_height = 15.2
+    total_raw = sum(raw_interval_heights) or 1.0
+    interval_heights = [h / total_raw * target_display_height for h in raw_interval_heights]
+
+    anchor_y = [0.0]
+    for h in interval_heights:
+        anchor_y.append(anchor_y[-1] + h)
+
+    section_bottom_y = anchor_y[-1]
 
     def md_to_y(md):
         if md is None or pd.isna(md):
@@ -380,9 +438,21 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         md = float(md)
         md = max(md, mudline_md)
         md = min(md, td_md)
-        frac = (md - mudline_md) / depth_span
-        return float(frac * section_bottom_y)
 
+        if md <= anchor_depths[0]:
+            return anchor_y[0]
+        if md >= anchor_depths[-1]:
+            return anchor_y[-1]
+
+        for i in range(len(anchor_depths) - 1):
+            a = anchor_depths[i]
+            b = anchor_depths[i + 1]
+            if a <= md <= b:
+                frac = 0.0 if b == a else (md - a) / (b - a)
+                return anchor_y[i] + frac * (anchor_y[i + 1] - anchor_y[i])
+        return anchor_y[-1]
+
+    # Wellbore width
     od_vals = pd.to_numeric(c['Casing_OD_in'], errors='coerce').astype(float)
     max_od = float(np.nanmax(od_vals)) if np.isfinite(od_vals).any() else 1.0
 
@@ -399,13 +469,14 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     x_well = -2.6
     x_hole = 1.45
     x_casing = 3.25
+
     left_edge = -14.2
     right_edge = 14.8
 
-    header_y = -0.22
-    title_y = -1.72
-    coord_y = -1.05
-    summary_y = -1.18
+    header_y = -0.05
+    title_y = -2.10
+    coord_y = -1.35
+    summary_y = -1.42
 
     well_name_raw = well.get('Well_Name', '')
     well_name = str(well_name_raw).strip() if pd.notna(well_name_raw) else ''
@@ -419,15 +490,18 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     bh_y = well.get('BottomHole_Y', '')
 
     ax.text(0, title_y, well_name, ha='center', va='center', fontsize=28, fontweight='bold')
+
     if prospect and prospect != 'nan':
         ax.text(0, title_y + 0.22, prospect, ha='center', fontsize=19)
-    ax.text(0, title_y + 0.40, 'WELLBORE SCHEMATIC', ha='center', fontsize=17, style='italic')
+
+    ax.text(0, title_y + 0.42, 'WELLBORE SCHEMATIC', ha='center', fontsize=17, style='italic')
 
     coord_lines = []
     if surf_x != '' or surf_y != '':
         coord_lines.append(f'Surface Location: X={surf_x}, Y={surf_y}')
     if bh_x != '' or bh_y != '':
         coord_lines.append(f'Bottom Hole Location: X={bh_x}, Y={bh_y}')
+
     if coord_lines:
         ax.text(left_edge + 4.35, coord_y, '\n'.join(coord_lines), ha='left', va='center', fontsize=16.2,
                 bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.55'))
@@ -436,7 +510,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     if logo_path.exists():
         try:
             logo = plt.imread(str(logo_path))
-            ax.imshow(logo, extent=[left_edge + 0.55, left_edge + 2.45, -1.60, -0.76], aspect='auto', zorder=0)
+            ax.imshow(logo, extent=[left_edge + 0.55, left_edge + 2.45, -2.00, -1.05], aspect='auto', zorder=0)
         except Exception:
             pass
 
@@ -446,6 +520,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         f'Mudline: {mudline_md:,.0f} ft MD\n'
         f'TD: {td_md:,.0f} ft MD'
     )
+
     ax.text(right_edge, summary_y, summary, ha='right', va='center', fontsize=16.6)
 
     headers = [
@@ -456,34 +531,38 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         (x_hole, 'HOLE'),
         (x_casing, 'CASING / FIT-LOT'),
     ]
+
     for x, txt in headers:
-        ax.text(x, header_y, txt, ha='center', va='center', fontsize=17.0, fontweight='bold')
+        ax.text(x, header_y, txt, ha='center', va='center', fontsize=17.0, fontweight='normal')
 
     separators = [-10.45, -7.75, -4.65, -0.85, 2.15]
     for x in separators:
-        ax.vlines(x, header_y + 0.15, section_bottom_y + 0.35, linewidth=1.1, alpha=0.75)
+        ax.vlines(x, header_y + 0.15, section_bottom_y + 0.40, linewidth=1.1, alpha=0.75)
 
     ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=14.5)
     ax.plot([x_well - 1.8, x_well + 1.8], [0.0, 0.0], color='black', linewidth=1.8)
 
-    # Dashed shoe-depth reference lines across the WBS.
+    # Dashed horizontal shoe lines
     shoe_line_depths = sorted(set(float(v) for v in c['Shoe_MD_ft'].dropna().tolist()))
     for shoe_md_line in shoe_line_depths:
         y_line = md_to_y(shoe_md_line)
         ax.hlines(y_line, left_edge + 0.45, right_edge - 0.45,
                   colors='0.35', linestyles=(0, (5, 4)), linewidth=1.0, alpha=0.75, zorder=0.4)
 
-    # Geometry
+    # Wellbore / casing geometry
     row_geometry = []
+
     for _, row in c.iterrows():
         od = row.get('Casing_OD_in', np.nan)
         width = casing_width(od)
+
         x_left = x_well - width / 2
         x_right = x_well + width / 2
 
         top_md = float(row['Top_MD_ft'])
         shoe_md = float(row['Shoe_MD_ft'])
         toc_md = float(row['TOC_MD_ft']) if pd.notna(row.get('TOC_MD_ft')) else np.nan
+
         top_y = md_to_y(top_md)
         shoe_y = md_to_y(shoe_md)
         toc_y = md_to_y(toc_md) if pd.notna(toc_md) else np.nan
@@ -492,10 +571,12 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         annulus_outer = width + 0.26
         ann_gap = (annulus_outer - width) / 2.0
         overlap = 0.018
+
         if shoe_y > cement_start_y:
             ax.add_patch(Rectangle((x_well - annulus_outer / 2, cement_start_y),
                                    ann_gap + overlap, shoe_y - cement_start_y,
                                    facecolor='dimgray', alpha=0.70, edgecolor='none', zorder=1))
+
             ax.add_patch(Rectangle((x_well + width / 2 - overlap, cement_start_y),
                                    ann_gap + overlap, shoe_y - cement_start_y,
                                    facecolor='dimgray', alpha=0.70, edgecolor='none', zorder=1))
@@ -516,44 +597,80 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         })
 
     for geom in row_geometry:
-        is_liner = (geom['top_md'] > mudline_md + 100.0)
+        is_liner = geom['top_md'] > mudline_md + 100.0
+
         if is_liner:
             child_od = geom['od']
             top_md = geom['top_md']
             candidates = []
+
             for parent in row_geometry:
                 if parent is geom:
                     continue
+
                 if pd.isna(parent['od']) or pd.isna(child_od) or parent['od'] <= child_od:
                     continue
+
                 if parent['top_md'] <= top_md <= parent['shoe_md']:
                     candidates.append(parent)
+
             if candidates:
                 parent = min(candidates, key=lambda g: g['od'])
                 draw_tol_symbol(ax, geom['x_left'], geom['x_right'], parent['x_left'], parent['x_right'], geom['top_y'], h=0.22)
+
         draw_shoe_symbol(ax, geom['x_left'], geom['x_right'], geom['shoe_y'], h=0.16)
 
+    # Calculated shoe lookup
     shoes_by_id = shoes.copy()
     if 'String_ID' in shoes_by_id.columns:
         shoes_by_id = shoes_by_id.set_index('String_ID', drop=False)
 
-    # Determine how many casing strings share each shoe depth so labels can be stacked.
+    # Casing label stacking
     shoe_groups = {}
-    for _, r in c.iterrows():
-        d = round(float(r['Shoe_MD_ft']), 3)
-        shoe_groups.setdefault(d, []).append(r)
+    for _, row in c.iterrows():
+        d = round(float(row['Shoe_MD_ft']), 3)
+        shoe_groups.setdefault(d, []).append(row)
 
-    # Pre-compute a centered vertical offset for every string sharing the same shoe.
     casing_label_offsets = {}
-    stack_spacing = 0.34
-    for d, rows_at_depth in shoe_groups.items():
-        count = len(rows_at_depth)
-        offsets = [(i - (count - 1) / 2.0) * stack_spacing for i in range(count)]
-        for r, off in zip(rows_at_depth, offsets):
-            casing_label_offsets[r.get('String_ID', id(r))] = off
+    stack_spacing = 0.56
 
+    for d, rows_at_depth in shoe_groups.items():
+        offsets = [-i * stack_spacing for i in range(len(rows_at_depth))]
+        for row, off in zip(rows_at_depth, offsets):
+            casing_label_offsets[row.get('String_ID', id(row))] = off
+
+    # Hole-section annotation positions
+    rows_by_shoe = {}
+    for _, row in c.iterrows():
+        d = round(float(row['Shoe_MD_ft']), 3)
+        rows_by_shoe.setdefault(d, []).append(row)
+
+    unique_shoes = sorted(rows_by_shoe.keys())
+    section_label_y_by_id = {}
+    previous_unique_shoe = mudline_md
+
+    for shoe_key in unique_shoes:
+        current_shoe = float(shoe_key)
+        rows_here = rows_by_shoe[shoe_key]
+
+        y0 = md_to_y(previous_unique_shoe)
+        y1 = md_to_y(current_shoe)
+
+        if len(rows_here) == 1:
+            fractions = [0.30]
+        else:
+            fractions = np.linspace(0.24, 0.68, len(rows_here))
+
+        for row, frac in zip(rows_here, fractions):
+            section_y = y0 + float(frac) * max(y1 - y0, 0.01)
+            section_label_y_by_id[row.get('String_ID', id(row))] = section_y
+
+        previous_unique_shoe = current_shoe
+
+    # PP / MW / Hole / Casing text
     for _, row in c.iterrows():
         sid = row.get('String_ID', np.nan)
+
         if 'String_ID' in shoes_by_id.columns and sid in shoes_by_id.index:
             srow = shoes_by_id.loc[sid]
             if isinstance(srow, pd.DataFrame):
@@ -563,27 +680,32 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
 
         top_md = float(row['Top_MD_ft'])
         shoe_md = float(row['Shoe_MD_ft'])
-        section_y = md_to_y((top_md + shoe_md) / 2.0)
+
+        section_y = section_label_y_by_id.get(sid, md_to_y((top_md + shoe_md) / 2.0))
         casing_label_y = md_to_y(shoe_md) + casing_label_offsets.get(sid, 0.0)
 
         ppmin = srow.get('Pore_Pressure_Min_ppg', row.get('Pore_Pressure_Min_ppg', np.nan))
         ppmax = srow.get('Pore_Pressure_Max_ppg', row.get('Pore_Pressure_Max_ppg', np.nan))
+
         if pd.notna(ppmin) and pd.notna(ppmax):
             pp_text = f'{float(ppmin):.1f}-{float(ppmax):.1f}\nppg'
         elif pd.notna(ppmax):
             pp_text = f'{float(ppmax):.1f}\nppg'
         else:
             pp_text = '-'
+
         ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=14.5)
 
         mwmin = srow.get('Mud_Weight_Min_ppg', row.get('Mud_Weight_Min_ppg', np.nan))
         mwmax = srow.get('Mud_Weight_Max_ppg', row.get('Mud_Weight_Max_ppg', np.nan))
         mudtype = str(srow.get('Mud_Type', row.get('Mud_Type', '')) or '')
+
         mud_lines = []
         if pd.notna(mwmin) and pd.notna(mwmax):
             mud_lines.append(f'MW {float(mwmin):.1f}-{float(mwmax):.1f} ppg')
         if mudtype and mudtype.lower() != 'nan':
             mud_lines.append(mudtype)
+
         ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=14.5)
 
         hole = row.get('Hole_Size_in', np.nan)
@@ -601,7 +723,6 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         inc = srow.get('Inc_at_Shoe_deg', np.nan)
         max_inc = srow.get('Max_Inc_to_Shoe_deg', np.nan)
 
-        # Horizontal, two-row casing description instead of a box.
         line1 = [str(row.get('String_Name', 'String'))]
         if pd.notna(od):
             line1.append(f'{float(od):g}"')
@@ -617,16 +738,19 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             line1.append(f'Shoe {shoe_md:,.0f} MD')
 
         line2 = []
-        is_liner = (top_md > mudline_md + 100.0)
+        is_liner = top_md > mudline_md + 100.0
         prefix = 'TOL' if is_liner else 'Top'
+
         if pd.notna(top_tvd):
             line2.append(f'{prefix} {top_md:,.0f} MD / {float(top_tvd):,.0f} TVD')
         else:
             line2.append(f'{prefix} {top_md:,.0f} MD')
+
         if pd.notna(toc_md) and pd.notna(toc_tvd):
             line2.append(f'TOC {float(toc_md):,.0f} MD / {float(toc_tvd):,.0f} TVD')
         elif pd.notna(toc_md):
             line2.append(f'TOC {float(toc_md):,.0f} MD')
+
         if pd.notna(inc):
             line2.append(f'Inc @ Shoe {float(inc):.1f}°')
         if pd.notna(max_inc):
@@ -634,45 +758,59 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
 
         fit_type = str(srow.get('FIT_LOT_Type', '') or '')
         fit_val = srow.get('FIT_LOT_Value', np.nan)
+
         if pd.notna(fit_val):
             label = fit_type if fit_type and fit_type.lower() != 'nan' else 'FIT/LOT'
             line2.append(f'{label} {float(fit_val):.2f} ppg EMW')
 
         casing_text = ' | '.join(line1) + '\n' + ' | '.join(line2)
-        ax.text(x_casing, casing_label_y, casing_text,
-                ha='left', va='center', fontsize=15.5, fontweight='semibold', linespacing=1.22)
 
+        ax.text(x_casing, casing_label_y, casing_text,
+                ha='left', va='center', fontsize=15.5,
+                fontweight='normal', linespacing=1.22)
+
+    # Geological tops
     if geocalc is not None and not geocalc.empty:
         g = geocalc.dropna(subset=['MD_ft']).sort_values('MD_ft').copy()
         actual_ys = [md_to_y(v) for v in g['MD_ft'].tolist()]
         valid_pairs = [(i, y) for i, y in enumerate(actual_ys) if pd.notna(y)]
+
         if valid_pairs:
-            min_sep = 0.26
+            min_sep = 0.34
             placed = []
+
             for _, y in valid_pairs:
-                placed.append(max(float(y), placed[-1] + min_sep if placed else 0.18))
+                placed.append(max(float(y), placed[-1] + min_sep if placed else 0.22))
+
             overflow = placed[-1] - (section_bottom_y - 0.10)
             if overflow > 0:
                 placed = [y - overflow for y in placed]
-            if placed[0] < 0.18:
-                shift = 0.18 - placed[0]
+
+            if placed[0] < 0.22:
+                shift = 0.22 - placed[0]
                 placed = [y + shift for y in placed]
 
             for (pair_idx, y_actual), y_text in zip(valid_pairs, placed):
                 row = g.iloc[pair_idx]
-                ax.plot([-10.58, -10.45], [y_actual, y_actual], color='black', linewidth=0.75)
+
+                ax.plot([-10.58, -10.45], [y_actual, y_actual], color='black', linewidth=0.95)
+
                 txt = f"{row['Formation_Name']}\nMD {row['MD_ft']:,.0f} | TVD {row['TVD_ft']:,.0f}"
+
                 ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=14.0)
 
     td_y = md_to_y(td_md)
-    ax.text(x_well + 1.45, td_y, f'TD {td_md:,.0f} MD', va='center', fontsize=17, fontweight='bold')
+
+    ax.text(x_well + 1.45, td_y, f'TD {td_md:,.0f} MD',
+            va='center', fontsize=17, fontweight='bold')
 
     ax.set_xlim(left_edge, right_edge)
-    ax.set_ylim(section_bottom_y + 0.55, -2.05)
+    ax.set_ylim(section_bottom_y + 0.65, -2.45)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_ylabel('')
     ax.grid(False)
+
     fig.tight_layout()
     return fig
 
@@ -1838,6 +1976,9 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
+
+
+
 
 
 
