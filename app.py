@@ -402,10 +402,10 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     left_edge = -14.2
     right_edge = 14.8
 
-    header_y = -0.52
-    title_y = -1.50
-    coord_y = -0.79
-    summary_y = -1.10
+    header_y = -0.22
+    title_y = -1.72
+    coord_y = -1.05
+    summary_y = -1.18
 
     well_name_raw = well.get('Well_Name', '')
     well_name = str(well_name_raw).strip() if pd.notna(well_name_raw) else ''
@@ -457,13 +457,13 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         (x_casing, 'CASING / FIT-LOT'),
     ]
     for x, txt in headers:
-        ax.text(x, header_y, txt, ha='center', va='center', fontsize=9.5, fontweight='bold')
+        ax.text(x, header_y, txt, ha='center', va='center', fontsize=17.0, fontweight='bold')
 
     separators = [-10.45, -7.75, -4.65, -0.85, 2.15]
     for x in separators:
         ax.vlines(x, header_y + 0.15, section_bottom_y + 0.35, linewidth=1.1, alpha=0.75)
 
-    ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=8)
+    ax.text(x_geo, 0.02, f'Mudline\n{mudline_md:,.0f} MD', va='center', ha='center', fontsize=14.5)
     ax.plot([x_well - 1.8, x_well + 1.8], [0.0, 0.0], color='black', linewidth=1.8)
 
     # Dashed shoe-depth reference lines across the WBS.
@@ -537,6 +537,21 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
     if 'String_ID' in shoes_by_id.columns:
         shoes_by_id = shoes_by_id.set_index('String_ID', drop=False)
 
+    # Determine how many casing strings share each shoe depth so labels can be stacked.
+    shoe_groups = {}
+    for _, r in c.iterrows():
+        d = round(float(r['Shoe_MD_ft']), 3)
+        shoe_groups.setdefault(d, []).append(r)
+
+    # Pre-compute a centered vertical offset for every string sharing the same shoe.
+    casing_label_offsets = {}
+    stack_spacing = 0.34
+    for d, rows_at_depth in shoe_groups.items():
+        count = len(rows_at_depth)
+        offsets = [(i - (count - 1) / 2.0) * stack_spacing for i in range(count)]
+        for r, off in zip(rows_at_depth, offsets):
+            casing_label_offsets[r.get('String_ID', id(r))] = off
+
     for _, row in c.iterrows():
         sid = row.get('String_ID', np.nan)
         if 'String_ID' in shoes_by_id.columns and sid in shoes_by_id.index:
@@ -549,7 +564,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         top_md = float(row['Top_MD_ft'])
         shoe_md = float(row['Shoe_MD_ft'])
         section_y = md_to_y((top_md + shoe_md) / 2.0)
-        casing_label_y = md_to_y(shoe_md)
+        casing_label_y = md_to_y(shoe_md) + casing_label_offsets.get(sid, 0.0)
 
         ppmin = srow.get('Pore_Pressure_Min_ppg', row.get('Pore_Pressure_Min_ppg', np.nan))
         ppmax = srow.get('Pore_Pressure_Max_ppg', row.get('Pore_Pressure_Max_ppg', np.nan))
@@ -559,7 +574,7 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             pp_text = f'{float(ppmax):.1f}\nppg'
         else:
             pp_text = '-'
-        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=7.8)
+        ax.text(x_pp, section_y, pp_text, ha='center', va='center', fontsize=14.5)
 
         mwmin = srow.get('Mud_Weight_Min_ppg', row.get('Mud_Weight_Min_ppg', np.nan))
         mwmax = srow.get('Mud_Weight_Max_ppg', row.get('Mud_Weight_Max_ppg', np.nan))
@@ -569,11 +584,11 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
             mud_lines.append(f'MW {float(mwmin):.1f}-{float(mwmax):.1f} ppg')
         if mudtype and mudtype.lower() != 'nan':
             mud_lines.append(mudtype)
-        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=7.8)
+        ax.text(x_mud, section_y, '\n'.join(mud_lines), ha='center', va='center', fontsize=14.5)
 
         hole = row.get('Hole_Size_in', np.nan)
         hole_text = f'{float(hole):g}"' if pd.notna(hole) else '-'
-        ax.text(x_hole, section_y, hole_text, ha='center', va='center', fontsize=8.2)
+        ax.text(x_hole, section_y, hole_text, ha='center', va='center', fontsize=14.5)
 
         od = row.get('Casing_OD_in', np.nan)
         cid = row.get('Casing_ID_in', np.nan)
@@ -586,47 +601,46 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
         inc = srow.get('Inc_at_Shoe_deg', np.nan)
         max_inc = srow.get('Max_Inc_to_Shoe_deg', np.nan)
 
-        spec_lines = [str(row.get('String_Name', 'String'))]
+        # Horizontal, two-row casing description instead of a box.
+        line1 = [str(row.get('String_Name', 'String'))]
         if pd.notna(od):
-            spec_lines.append(f'Size {float(od):g}"')
-        size_bits = []
-        if pd.notna(od):
-            size_bits.append(f'OD {float(od):g}"')
+            line1.append(f'{float(od):g}"')
         if pd.notna(cid):
-            size_bits.append(f'ID {float(cid):g}"')
-        if size_bits:
-            spec_lines.append(' | '.join(size_bits))
+            line1.append(f'ID {float(cid):g}"')
         if pd.notna(drift):
-            spec_lines.append(f'Drift {float(drift):g}"')
+            line1.append(f'Drift {float(drift):g}"')
         if grade and grade.lower() != 'nan':
-            spec_lines.append(f'Grade {grade}')
+            line1.append(f'Grade {grade}')
         if pd.notna(shoe_tvd):
-            spec_lines.append(f'Shoe {shoe_md:,.0f} MD / {float(shoe_tvd):,.0f} TVD')
+            line1.append(f'Shoe {shoe_md:,.0f} MD / {float(shoe_tvd):,.0f} TVD')
         else:
-            spec_lines.append(f'Shoe {shoe_md:,.0f} MD')
+            line1.append(f'Shoe {shoe_md:,.0f} MD')
+
+        line2 = []
         is_liner = (top_md > mudline_md + 100.0)
         prefix = 'TOL' if is_liner else 'Top'
         if pd.notna(top_tvd):
-            spec_lines.append(f'{prefix} {top_md:,.0f} MD / {float(top_tvd):,.0f} TVD')
+            line2.append(f'{prefix} {top_md:,.0f} MD / {float(top_tvd):,.0f} TVD')
         else:
-            spec_lines.append(f'{prefix} {top_md:,.0f} MD')
+            line2.append(f'{prefix} {top_md:,.0f} MD')
         if pd.notna(toc_md) and pd.notna(toc_tvd):
-            spec_lines.append(f'TOC {float(toc_md):,.0f} MD / {float(toc_tvd):,.0f} TVD')
+            line2.append(f'TOC {float(toc_md):,.0f} MD / {float(toc_tvd):,.0f} TVD')
         elif pd.notna(toc_md):
-            spec_lines.append(f'TOC {float(toc_md):,.0f} MD')
+            line2.append(f'TOC {float(toc_md):,.0f} MD')
         if pd.notna(inc):
-            spec_lines.append(f'Inc at Shoe {float(inc):.1f}°')
+            line2.append(f'Inc @ Shoe {float(inc):.1f}°')
         if pd.notna(max_inc):
-            spec_lines.append(f'Max Inclination {float(max_inc):.1f}°')
+            line2.append(f'Max Inc {float(max_inc):.1f}°')
 
         fit_type = str(srow.get('FIT_LOT_Type', '') or '')
         fit_val = srow.get('FIT_LOT_Value', np.nan)
         if pd.notna(fit_val):
             label = fit_type if fit_type and fit_type.lower() != 'nan' else 'FIT/LOT'
-            spec_lines.append(f'{label} {float(fit_val):.2f} ppg EMW')
+            line2.append(f'{label} {float(fit_val):.2f} ppg EMW')
 
-        ax.text(x_casing, casing_label_y, '\n'.join(spec_lines), ha='left', va='center', fontsize=14.4,
-                bbox=dict(boxstyle='round,pad=0.32', facecolor='white', edgecolor='0.35', linewidth=1.3))
+        casing_text = ' | '.join(line1) + '\n' + ' | '.join(line2)
+        ax.text(x_casing, casing_label_y, casing_text,
+                ha='left', va='center', fontsize=15.5, fontweight='semibold', linespacing=1.22)
 
     if geocalc is not None and not geocalc.empty:
         g = geocalc.dropna(subset=['MD_ft']).sort_values('MD_ft').copy()
@@ -648,13 +662,13 @@ def draw_wbs(well, casing, shoes, geocalc, fitlot=None):
                 row = g.iloc[pair_idx]
                 ax.plot([-10.58, -10.45], [y_actual, y_actual], color='black', linewidth=0.75)
                 txt = f"{row['Formation_Name']}\nMD {row['MD_ft']:,.0f} | TVD {row['TVD_ft']:,.0f}"
-                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=7.05)
+                ax.text(x_geo, y_text, txt, ha='center', va='center', fontsize=14.0)
 
     td_y = md_to_y(td_md)
     ax.text(x_well + 1.45, td_y, f'TD {td_md:,.0f} MD', va='center', fontsize=17, fontweight='bold')
 
     ax.set_xlim(left_edge, right_edge)
-    ax.set_ylim(section_bottom_y + 0.55, -1.75)
+    ax.set_ylim(section_bottom_y + 0.55, -2.05)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_ylabel('')
@@ -1824,5 +1838,8 @@ except Exception as e:
         "workbook could not be created."
     )
     st.error(str(e))
+
+
+
 
 
